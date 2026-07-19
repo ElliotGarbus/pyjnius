@@ -13,8 +13,12 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. Two remaining criteria (on-device load + Java-interface
-round-trip) are not yet done.
+via cross-download. **Step 2 (the SDL-independent `JNI_GetCreatedJavaVMs`
+fallback) is now implemented** — the runtime resolver is three-tier (SDL3 → SDL2
+→ `JNI_GetCreatedJavaVMs`), and ELF verification confirms the fallback added
+**zero** new undefined/linked symbols (`JNI_GetCreatedJavaVMs` is `dlsym`'d,
+`AttachCurrentThread` goes through the JVM vtable). Two remaining criteria
+(on-device load + Java-interface round-trip) are not yet done.
 
 ---
 
@@ -50,18 +54,31 @@ Windows path — repoint it at the GitHub fork before any upstream PR.
 
 `AndroidJavaLocation.get_libraries()` now returns `['log']` instead of
 `['SDL2', 'log']`. A `DT_NEEDED` on a specific `libSDL*.so` would lock the wheel
-to one SDL/Kivy generation and fail to `dlopen` against the other.
+to one SDL/Kivy generation and fail to `dlopen` against the other. (`jnius/env.py`
+is just a shim that re-exports `jnius_config.env`.)
 
-### 2. `jnius/jnius_jvm_android.pxi` — resolve the JNIEnv at runtime
+### 2. `jnius/jnius_jvm_android.pxi` — resolve the JNIEnv at runtime (three-tier)
 
-Replaced the direct `extern SDL_AndroidGetJNIEnv()` call with a
-`dlsym(RTLD_DEFAULT, ...)` lookup: try `SDL_GetAndroidJNIEnv` (SDL3), then
-`SDL_AndroidGetJNIEnv` (SDL2). Removing the direct symbol reference is **required**,
-not just preferred: the NDK link uses `-Wl,--no-undefined`, so a leftover
-undefined SDL symbol would fail the link.
+Replaced the direct `extern SDL_AndroidGetJNIEnv()` call with a runtime
+`dlsym(RTLD_DEFAULT, ...)` resolver that tries, in order:
 
-> These edits currently live as copies in this clone. Put them on a git branch
-> (see Next steps) so they are tracked.
+1. `SDL_GetAndroidJNIEnv` (SDL3)
+2. `SDL_AndroidGetJNIEnv` (SDL2)
+3. `JNI_GetCreatedJavaVMs` + `AttachCurrentThread` (SDL-independent) — **Step 2**
+
+The SDL getters return a `JNIEnv*` directly. The `JNI_GetCreatedJavaVMs` fallback
+(`_jnienv_from_created_vm()`) `dlsym`s the symbol, retrieves the process' existing
+JavaVM, and `AttachCurrentThread`s to get the `JNIEnv`. If all three fail it
+raises a clear `RuntimeError` naming the host contract.
+
+Removing every direct symbol reference is **required**, not just preferred: the
+NDK link uses `-Wl,--no-undefined`, so any leftover undefined symbol (SDL *or*
+JNI) would fail the link. The ELF check below confirms none survive.
+
+> These edits are committed on branch **`spike/android-universal-wheel`**
+> (working tree clean). `origin` still points at the Windows clone
+> `/mnt/c/Users/ellio/PycharmProjects/pyjnius` — repoint at the GitHub fork
+> before any upstream PR.
 
 ---
 
@@ -89,6 +106,7 @@ READELF=~/android-sdk/ndk/27.3.13750724/toolchains/llvm/prebuilt/linux-x86_64/bi
 # unzip a wheel, then:
 $READELF -d        jnius/jnius*.so | grep NEEDED       # -> libm liblog libpython3.14 libdl libc  (NO libSDL)
 $READELF --dyn-syms jnius/jnius*.so | grep -i sdl      # -> (none)
+$READELF --dyn-syms jnius/jnius*.so | grep -iE "JNI_GetCreatedJavaVMs|AttachCurrentThread"  # -> (none: dlsym'd / vtable, not linked)
 $READELF --dyn-syms jnius/jnius*.so | grep -i dlsym    # -> dlsym@LIBC (the runtime resolver)
 ```
 
@@ -125,17 +143,18 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
 
 ## Next steps (agreed plan: option 2 then 3)
 
-### Step 2 — `dlsym`'d `JNI_GetCreatedJavaVMs` fallback (do first)
+### Step 2 — `dlsym`'d `JNI_GetCreatedJavaVMs` fallback — DONE ✅
 
-Add an SDL-independent fallback in `jnius_jvm_android.pxi`: if neither SDL getter
-resolves, `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` and, if found, get the
-JavaVM and `AttachCurrentThread` to obtain the `JNIEnv`. **Must be `dlsym`'d, not
-linked**, to avoid re-introducing an undefined symbol under `-Wl,--no-undefined`.
-Rationale: it lets the wheel be validated in cibuildwheel's *SDL-less* CPython
-testbed (which still runs inside Android's ART VM), and makes the wheel work on
-non-SDL hosts — the honest "an in-process JVM exists" contract for PyPI.
+Implemented in `jnius_jvm_android.pxi` as `_jnienv_from_created_vm()`: if neither
+SDL getter resolves, `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` and, if found,
+get the JavaVM and `AttachCurrentThread` to obtain the `JNIEnv`. Confirmed
+`dlsym`'d, not linked (ELF check: no new UND symbol). Both wheels rebuilt and
+re-verified; arm64 wheel re-cross-installs cleanly. This unblocks validation in
+cibuildwheel's *SDL-less* CPython testbed (which still runs inside Android's ART
+VM) and makes the wheel work on non-SDL hosts — the honest "an in-process JVM
+exists" contract for PyPI.
 
-### Step 3 — on-device smoke test
+### Step 3 — on-device smoke test (do next)
 
 1. One-time privileged step (user must run; `sudo` needs a password):
    ```bash
