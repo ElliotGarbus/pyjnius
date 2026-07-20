@@ -75,10 +75,10 @@ Removing every direct symbol reference is **required**, not just preferred: the
 NDK link uses `-Wl,--no-undefined`, so any leftover undefined symbol (SDL *or*
 JNI) would fail the link. The ELF check below confirms none survive.
 
-> These edits are committed on branch **`spike/android-universal-wheel`**
-> (working tree clean). `origin` still points at the Windows clone
-> `/mnt/c/Users/ellio/PycharmProjects/pyjnius` — repoint at the GitHub fork
-> before any upstream PR.
+> These edits are committed and pushed on branch
+> **`spike/android-universal-wheel`** (tracks `origin`). Remotes: `origin` →
+> `github.com/ElliotGarbus/pyjnius` (the fork), `upstream` → `github.com/kivy/pyjnius`,
+> `local` → the Windows clone `/mnt/c/Users/ellio/PycharmProjects/pyjnius`.
 
 ---
 
@@ -93,8 +93,9 @@ cd ~/pyjnius-spike
 echo "DEF JNIUS_PLATFORM = 'android'" > jnius/config.pxi
 uvx --from "Cython~=3.1.2" cython -3 jnius/jnius.pyx -o jnius/jnius.c
 
-export CIBW_PLATFORM=android
-export ANDROID_API_LEVEL=24
+# API level, ABIs, and build frontend are now pinned in
+# pyproject.toml [tool.cibuildwheel.android] — no manual exports needed.
+# --only computes the platform, so no CIBW_PLATFORM either.
 cibuildwheel --only cp314-android_x86_64    --output-dir ~/wheelhouse
 cibuildwheel --only cp314-android_arm64_v8a --output-dir ~/wheelhouse
 ```
@@ -126,18 +127,29 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
 - [x] `pip install` cross-download installs cleanly
 - [ ] Imports/runs on an emulator/device (blocked — see Next steps)
 - [ ] Python-implements-Java-interface round-trip (Java-glue delivery convention undecided)
-- [~] Reproducible from pinned inputs (pins recorded below; not yet locked into `pyproject.toml`)
+- [x] Reproducible from pinned inputs (locked into `pyproject.toml`
+      `[tool.cibuildwheel.android]`; NDK pinned via the cibuildwheel version).
+      Caveat: toolchain inputs are pinned, but wheels are not yet *bit-for-bit*
+      identical (would additionally need `SOURCE_DATE_EPOCH` etc.)
 
 ## Reproducibility pins
 
-| Input | Value |
-|---|---|
-| NDK | 27.3.13750724 |
-| ANDROID_API_LEVEL | 24 |
-| cibuildwheel | 4.1.0 |
-| Cython | ~=3.1.2 (3.1.8 used) |
-| CPython target | 3.14 (cp314); add 3.15 pre-release via `--enable cpython-prerelease` |
-| ABIs | arm64_v8a (ship), x86_64 (test) |
+Locked in `pyproject.toml` `[tool.cibuildwheel.android]` except where noted.
+cibuildwheel has **no NDK-version key**: the NDK is a function of the cibuildwheel
+version, so pinning cibuildwheel pins the NDK.
+
+| Input | Value | Where pinned |
+|---|---|---|
+| NDK | 27.3.13750724 | implied by cibuildwheel 4.1.0 (documented in `pyproject.toml` comment) |
+| ANDROID_API_LEVEL | 24 | `[tool.cibuildwheel.android].environment` |
+| ABIs | arm64_v8a (ship), x86_64 (test) | `[tool.cibuildwheel.android].archs` |
+| build frontend | `build` (Android forbids `pip`) | `[tool.cibuildwheel.android].build-frontend` |
+| cibuildwheel | 4.1.0 | operational (uv tool); pin in CI when set up |
+| Cython | ~=3.1.2 (3.1.8 used) | `[build-system].requires` |
+| CPython target | 3.14 (cp314); add 3.15 pre-release via `--enable cpython-prerelease` | build invocation (`--only`) |
+
+> Verified: building with **no** `ANDROID_API_LEVEL`/`CIBW_PLATFORM` exports still
+> produces `android_24_*` — the config alone drives it.
 
 ---
 
@@ -177,8 +189,9 @@ first). Exercising the SDL path requires a real minimal SDL/Kivy Gradle app.
   **not** in the `.java/` dot-directory convention that AGP generators auto-extract.
   Decide: teach the kivyforge backend to pull from `jnius/src/...`, or adopt the
   `pyjnius-builder` `.java/` convention.
-- Lock the pins into a `[tool.cibuildwheel]` config in `pyproject.toml`.
-- Write the findings deliverable and prepare the upstream PR (repoint `origin`).
+- ~~Lock the pins into a `[tool.cibuildwheel]` config in `pyproject.toml`.~~ DONE ✅
+- Write the findings deliverable and prepare the upstream PR (`origin` already
+  points at the fork; `upstream` at `kivy/pyjnius`).
 
 ## Open risks to settle empirically
 

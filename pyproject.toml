@@ -4,3 +4,36 @@ requires = [
     "wheel",
     "Cython~=3.1.2",
 ]
+
+# --- Android wheel build (spike) ---------------------------------------------
+# Reproducible cibuildwheel configuration for the redistributable, SDL-agnostic
+# Android wheel. All keys are scoped to the `android` subsection so desktop
+# builds are unaffected.
+#
+# Toolchain pins (the inputs that determine the produced wheel):
+#   * cibuildwheel : 4.1.0  -- pins the NDK it installs via sdkmanager.
+#     cibuildwheel has no NDK-version key; the NDK is a function of the
+#     cibuildwheel version, so pin cibuildwheel to pin the NDK.
+#   * NDK          : 27.3.13750724  (installed by cibuildwheel 4.1.0)
+#   * Cython       : ~=3.1.2  (build-only; see [build-system] above)
+#
+# Invocation (ABI is selected per run; only the build-host arch is testable):
+#   uvx --from "Cython~=3.1.2" cython -3 jnius/jnius.pyx -o jnius/jnius.c
+#   cibuildwheel --only cp314-android_x86_64    --output-dir ~/wheelhouse
+#   cibuildwheel --only cp314-android_arm64_v8a --output-dir ~/wheelhouse
+#
+# CPython 3.15 (final Oct 2026) additionally needs `--enable cpython-prerelease`
+# on the command line; the 3.14 config below is unchanged for it.
+[tool.cibuildwheel.android]
+# Android does not support the `pip` build frontend.
+build-frontend = "build"
+
+# The two target ABIs: arm64_v8a ships to devices; x86_64 is the testability ABI
+# (cibuildwheel's emulator testbed only runs the build-host architecture).
+archs = ["arm64_v8a", "x86_64"]
+
+# Minimum supported API level baked into the wheel tag (-> android_24_*). 24 is
+# the first level with RUNPATH (required by auditwheel to graft external .so's)
+# and covers ~99% of active devices. Set here so it no longer needs a manual
+# `export ANDROID_API_LEVEL=24`.
+environment = { ANDROID_API_LEVEL = "24" }
