@@ -71,6 +71,25 @@ The SDL getters return a `JNIEnv*` directly. The `JNI_GetCreatedJavaVMs` fallbac
 JavaVM, and `AttachCurrentThread`s to get the `JNIEnv`. If all three fail it
 raises a clear `RuntimeError` naming the host contract.
 
+> **API-level scope of the three tiers (settled).** Tiers 1–2 (SDL) are the
+> primary path and work on **all** supported API levels (≥ 24): a Kivy/SDL host
+> `System.loadLibrary`s SDL, SDL's own `JNI_OnLoad` captures the JavaVM, and SDL
+> re-exposes it via the getter we `dlsym`. Tier 3 (`JNI_GetCreatedJavaVMs`) is
+> **best-effort, effectively API 31+**: that symbol only became a public
+> `libnativehelper` export in Android 12 / API 31 (`introduced=S`,
+> [android/ndk#1969](https://github.com/android/ndk/issues/1969)); on API 24–30
+> it's outside the app linker namespace and the `dlsym` typically returns `NULL`,
+> so a non-SDL host there falls through to the `RuntimeError`. This is fine —
+> `minSdk` stays 24 because the SDL path covers those levels for the real target.
+>
+> **`JNI_OnLoad` is *not* an alternative here.** It's the officially-blessed,
+> all-API way to receive the JavaVM, but Android only calls it for libs loaded
+> via `System.loadLibrary` (ART does `dlopen` + `dlsym("JNI_OnLoad")`). This `.so`
+> is a CPython extension loaded by a plain `dlopen()` on `import`, so ART never
+> calls a `JNI_OnLoad` defined in it — it would be dead code. The all-API
+> SDL-independent option, if ever needed, is an explicit host-provided setter
+> (a §5 runtime-contract API), not autodetection.
+
 Removing every direct symbol reference is **required**, not just preferred: the
 NDK link uses `-Wl,--no-undefined`, so any leftover undefined symbol (SDL *or*
 JNI) would fail the link. The ELF check below confirms none survive.
@@ -195,7 +214,10 @@ first). Exercising the SDL path requires a real minimal SDL/Kivy Gradle app.
 
 ## Open risks to settle empirically
 
-- Is `JNI_GetCreatedJavaVMs` reliably `dlsym`-able and does it reach ART across API
-  levels? (Step 2/3 answers this.)
+- ~~Is `JNI_GetCreatedJavaVMs` reliably `dlsym`-able and does it reach ART across
+  API levels?~~ **SETTLED (docs):** no — it's a public `libnativehelper` export
+  only on **API 31+** (`introduced=S`, [android/ndk#1969](https://github.com/android/ndk/issues/1969)).
+  Treated as best-effort tier 3; the SDL path (tiers 1–2) carries API 24–30. Still
+  worth an empirical check on a 31+ emulator (Step 3) and, if we care, a 24–30 one.
 - Does `dlsym(RTLD_DEFAULT, ...)` find a host-loaded SDL getter on bionic at the
   target API levels? (needs a real SDL host to confirm.)

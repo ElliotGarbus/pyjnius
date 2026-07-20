@@ -6,16 +6,32 @@
 #
 # Instead we resolve the env at *runtime*, in order of preference:
 #
-#   1. dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv")  -- SDL3
-#   2. dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")  -- SDL2
-#   3. dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") -- SDL-independent
+#   1. dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv")  -- SDL3 (primary; all API levels)
+#   2. dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")  -- SDL2 (primary; all API levels)
+#   3. dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") -- SDL-independent, best-effort
 #
-# A Kivy/SDL host has already loaded its SDL library into the process' global
-# symbol namespace before ``import jnius``, so whichever SDL getter exists is
-# found without any DT_NEEDED on libSDL*.so. The JNI_GetCreatedJavaVMs fallback
-# covers non-SDL hosts (and cibuildwheel's SDL-less testbed): Android's ART is an
-# in-process JVM, so the runtime exports JNI_GetCreatedJavaVMs and we attach the
-# calling thread to obtain a JNIEnv.
+# Tiers 1-2 are the primary path and work on every supported API level: a Kivy/SDL
+# host loads its SDL library via System.loadLibrary before ``import jnius``, so
+# SDL's own JNI_OnLoad has captured the JavaVM, and SDL re-exposes it as the getter
+# we dlsym here. This is the only viable mechanism for a *dlopen'd* CPython
+# extension (see the JNI_OnLoad note below).
+#
+# Tier 3 is a *best-effort* fallback for non-SDL hosts (and cibuildwheel's SDL-less
+# testbed, which runs a modern maxVersion emulator). IMPORTANT: JNI_GetCreatedJavaVMs
+# was only made a public libnativehelper export in Android 12 / API 31
+# ("introduced=S"); on API 24-30 it is outside the app's linker namespace and this
+# dlsym typically returns NULL. That is acceptable: on those older levels the SDL
+# path (tiers 1-2) already supplies the env for the actual target (Kivy apps), and
+# a non-SDL host on API < 31 simply falls through to the clear RuntimeError below.
+#
+# Why NOT JNI_OnLoad(JavaVM*, void*)?  It is the officially-blessed, all-API way to
+# receive the JavaVM -- BUT Android only calls it for libraries loaded via Java's
+# System.loadLibrary() (ART's LoadNativeLibrary does dlopen + dlsym("JNI_OnLoad")).
+# This .so is a CPython extension imported via a plain dlopen(), so ART never calls
+# a JNI_OnLoad defined here -- it would be dead code. The host's System.loadLibrary'd
+# libs (e.g. SDL) are where JNI_OnLoad legitimately fires; we consume the result of
+# theirs via the getters above. A truly SDL-independent, all-API path would require
+# the host to hand us the VM explicitly (a §5 runtime-contract setter), not autodetection.
 #
 # Every symbol here is resolved with dlsym and NONE is linked: the NDK links with
 # ``-Wl,--no-undefined``, so a leftover undefined reference (SDL or JNI) would
@@ -42,10 +58,13 @@ cdef JNIEnv *_jnienv_from_sdl():
 
 
 cdef JNIEnv *_jnienv_from_created_vm():
-    # SDL-independent path: if an in-process JVM already exists (always true under
-    # Android's ART), JNI_GetCreatedJavaVMs yields the JavaVM and we attach the
-    # current thread to obtain its JNIEnv. Returns NULL if the symbol is absent,
-    # no VM has been created, or the attach fails.
+    # SDL-independent, best-effort path. JNI_GetCreatedJavaVMs is a public
+    # libnativehelper export only on API 31+ (Android 12); on API 24-30 this
+    # dlsym typically returns NULL (the symbol is outside the app linker
+    # namespace) and we return NULL so the caller falls through to a clear
+    # error. Where it does resolve, it yields the process' existing JavaVM and
+    # we attach the current thread to obtain its JNIEnv. Returns NULL if the
+    # symbol is absent, no VM has been created, or the attach fails.
     cdef void *sym = dlsym(RTLD_DEFAULT, b"JNI_GetCreatedJavaVMs")
     if sym == NULL:
         return NULL
