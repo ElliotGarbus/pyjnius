@@ -152,7 +152,12 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
       `getProperty('java.vm.name')` returned `Dalvik`, env via the tier-3
       `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs` fallback. The SDL-host
       path (SDL2 *and* SDL3) still needs a real minimal SDL/Kivy Gradle app.
-- [ ] Python-implements-Java-interface round-trip (Java-glue delivery convention undecided)
+- [~] Python-implements-Java-interface round-trip — **delivery convention now
+      SETTLED** (Option B: ship the glue as source in a `.java/` dot-directory; see
+      "Java-glue delivery" below). The wheel side is defined; demonstrating the
+      round-trip on-device is gated on consumer-side glue routing (p4a needs the
+      `.java/`-extraction change in the appended draft issue; `ksproject` already
+      extracts `.java/`).
 - [x] Reproducible from pinned inputs (locked into `pyproject.toml`
       `[tool.cibuildwheel.android]`; NDK pinned via the cibuildwheel version).
       Caveat: toolchain inputs are pinned, but wheels are not yet *bit-for-bit*
