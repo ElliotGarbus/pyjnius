@@ -13,12 +13,15 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Step 2 (the SDL-independent `JNI_GetCreatedJavaVMs`
-fallback) is now implemented** — the runtime resolver is three-tier (SDL3 → SDL2
-→ `JNI_GetCreatedJavaVMs`), and ELF verification confirms the fallback added
-**zero** new undefined/linked symbols (`JNI_GetCreatedJavaVMs` is `dlsym`'d,
-`AttachCurrentThread` goes through the JVM vtable). Two remaining criteria
-(on-device load + Java-interface round-trip) are not yet done.
+via cross-download. **Steps 2 and 3 are done.** The runtime resolver is three-tier
+(SDL3 → SDL2 → `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs`), and the wheel
+**imports and round-trips through ART on an emulator** (Step 3): the cibuildwheel
+Android testbed on an API-35 x86_64 emulator ran
+`autoclass('java.lang.System').getProperty('java.vm.name')` → **`Dalvik`** (vendor
+`The Android Project`), with the `JNIEnv` obtained via the SDL-independent tier-3
+fallback. ELF verification confirms the resolver added **no** `DT_NEEDED`
+(no libSDL, no libnativehelper, no libart — only `dlopen`/`dlsym@LIBC`). The one
+remaining criterion (Python-implements-Java-interface round-trip) is not yet done.
 
 ---
 
@@ -144,7 +147,11 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
 
 - [x] Builds `android_24_arm64_v8a` **and** `android_24_x86_64`, no host app present
 - [x] `pip install` cross-download installs cleanly
-- [ ] Imports/runs on an emulator/device (blocked — see Next steps)
+- [x] Imports/runs on an emulator/device — **SDL-less path only.** cibuildwheel
+      testbed, API-35 x86_64 emulator: `autoclass('java.lang.System')` resolved and
+      `getProperty('java.vm.name')` returned `Dalvik`, env via the tier-3
+      `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs` fallback. The SDL-host
+      path (SDL2 *and* SDL3) still needs a real minimal SDL/Kivy Gradle app.
 - [ ] Python-implements-Java-interface round-trip (Java-glue delivery convention undecided)
 - [x] Reproducible from pinned inputs (locked into `pyproject.toml`
       `[tool.cibuildwheel.android]`; NDK pinned via the cibuildwheel version).
@@ -174,32 +181,45 @@ version, so pinning cibuildwheel pins the NDK.
 
 ## Next steps (agreed plan: option 2 then 3)
 
-### Step 2 — `dlsym`'d `JNI_GetCreatedJavaVMs` fallback — DONE ✅
+### Step 2 — SDL-independent `JNI_GetCreatedJavaVMs` fallback — DONE ✅
 
-Implemented in `jnius_jvm_android.pxi` as `_jnienv_from_created_vm()`: if neither
-SDL getter resolves, `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` and, if found,
-get the JavaVM and `AttachCurrentThread` to obtain the `JNIEnv`. Confirmed
-`dlsym`'d, not linked (ELF check: no new UND symbol). Both wheels rebuilt and
-re-verified; arm64 wheel re-cross-installs cleanly. This unblocks validation in
-cibuildwheel's *SDL-less* CPython testbed (which still runs inside Android's ART
-VM) and makes the wheel work on non-SDL hosts — the honest "an in-process JVM
-exists" contract for PyPI.
+Implemented in `jnius_jvm_android.pxi` as `_jnienv_from_created_vm()` /
+`_resolve_get_created_javavms()`: if neither SDL getter resolves, obtain the
+process' JavaVM via `JNI_GetCreatedJavaVMs` and `AttachCurrentThread` to get the
+`JNIEnv`. See Step 3 for the empirical correction to *how* the symbol is resolved
+(`dlopen` by soname, not `RTLD_DEFAULT`). Confirmed not linked (ELF check).
 
-### Step 3 — on-device smoke test (do next)
+### Step 3 — on-device smoke test — DONE ✅
 
-1. One-time privileged step (user must run; `sudo` needs a password):
-   ```bash
-   sudo usermod -aG kvm $USER      # then, from Windows: wsl --shutdown, and reopen
-   ```
-2. Run the wheel test via cibuildwheel's Android testbed on an x86_64 emulator
-   (only the build-host arch is testable): verify
-   `autoclass('java.lang.System').getProperty('java.version')` returns.
+Ran via cibuildwheel's Android testbed on a `--managed maxVersion` (API-35)
+x86_64 emulator (KVM available). Result:
 
-### Known gotcha — test-harness mismatch
+```
+ANDROID_SMOKE_OK vm.name=Dalvik vendor=The Android Project java.version=0
+✓ cp314-android_x86_64 finished
+```
 
-cibuildwheel's testbed has **no SDL loaded**, so the `dlsym` SDL path cannot be
-exercised there — only the `JNI_GetCreatedJavaVMs` fallback can (hence Step 2
-first). Exercising the SDL path requires a real minimal SDL/Kivy Gradle app.
+`autoclass('java.lang.System')` resolved and `getProperty('java.vm.name')`
+returned `Dalvik` — a real ART round-trip, with the `JNIEnv` from the tier-3
+fallback (the testbed has no SDL). (`java.version` is `0` on Android; that's
+normal — `java.vm.*` carries the real info.) Test config lives in
+`pyproject.toml` `[tool.cibuildwheel.android].test-command`.
+
+> **KEY EMPIRICAL FINDING (changed the implementation).** The first run *failed*:
+> `dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs")` returned NULL **even on API 35**.
+> "Public export at API 31+" means you may *link* `-lnativehelper`, not that the
+> symbol is reachable via `RTLD_DEFAULT` — `libnativehelper.so` isn't in the
+> extension's default lookup scope. Fix: **`dlopen("libnativehelper.so")` by
+> soname** (permitted for apps on API 31+) then `dlsym` the handle. `dlopen` is
+> runtime-only, so ELF re-verification shows **no new `DT_NEEDED`** (still no
+> libSDL/libnativehelper/libart; only `dlopen`/`dlsym@LIBC`). After this change the
+> testbed passes.
+
+### Known gotcha — test-harness mismatch (still true)
+
+cibuildwheel's testbed has **no SDL loaded**, so only the tier-3 path is exercised
+there, not the SDL getters. Exercising the SDL path (SDL2 *and* SDL3) requires a
+real minimal SDL/Kivy Gradle app — the remaining piece for the on-device criterion.
 
 ### Later
 
@@ -215,9 +235,11 @@ first). Exercising the SDL path requires a real minimal SDL/Kivy Gradle app.
 ## Open risks to settle empirically
 
 - ~~Is `JNI_GetCreatedJavaVMs` reliably `dlsym`-able and does it reach ART across
-  API levels?~~ **SETTLED (docs):** no — it's a public `libnativehelper` export
-  only on **API 31+** (`introduced=S`, [android/ndk#1969](https://github.com/android/ndk/issues/1969)).
-  Treated as best-effort tier 3; the SDL path (tiers 1–2) carries API 24–30. Still
-  worth an empirical check on a 31+ emulator (Step 3) and, if we care, a 24–30 one.
+  API levels?~~ **SETTLED EMPIRICALLY (Step 3).** It's a public `libnativehelper`
+  export only on **API 31+** (`introduced=S`, [android/ndk#1969](https://github.com/android/ndk/issues/1969)),
+  and `RTLD_DEFAULT` does **not** reach it even at API 35 — must `dlopen`
+  `libnativehelper.so` by soname. With that, ART round-trip confirmed on an API-35
+  emulator. Best-effort tier 3 (API 31+); SDL path (tiers 1–2) carries API 24–30.
+  A 24–30 non-SDL check would just confirm the documented fall-through to RuntimeError.
 - Does `dlsym(RTLD_DEFAULT, ...)` find a host-loaded SDL getter on bionic at the
   target API levels? (needs a real SDL host to confirm.)

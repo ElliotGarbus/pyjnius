@@ -8,7 +8,7 @@
 #
 #   1. dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv")  -- SDL3 (primary; all API levels)
 #   2. dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")  -- SDL2 (primary; all API levels)
-#   3. dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") -- SDL-independent, best-effort
+#   3. dlopen("libnativehelper.so") + JNI_GetCreatedJavaVMs -- SDL-independent, API 31+
 #
 # Tiers 1-2 are the primary path and work on every supported API level: a Kivy/SDL
 # host loads its SDL library via System.loadLibrary before ``import jnius``, so
@@ -17,12 +17,16 @@
 # extension (see the JNI_OnLoad note below).
 #
 # Tier 3 is a *best-effort* fallback for non-SDL hosts (and cibuildwheel's SDL-less
-# testbed, which runs a modern maxVersion emulator). IMPORTANT: JNI_GetCreatedJavaVMs
-# was only made a public libnativehelper export in Android 12 / API 31
-# ("introduced=S"); on API 24-30 it is outside the app's linker namespace and this
-# dlsym typically returns NULL. That is acceptable: on those older levels the SDL
-# path (tiers 1-2) already supplies the env for the actual target (Kivy apps), and
-# a non-SDL host on API < 31 simply falls through to the clear RuntimeError below.
+# testbed). JNI_GetCreatedJavaVMs became a public libnativehelper export only in
+# Android 12 / API 31 ("introduced=S"). EMPIRICAL FINDING (cibuildwheel testbed,
+# API 35): dlsym(RTLD_DEFAULT, "JNI_GetCreatedJavaVMs") still returns NULL even at
+# API 31+, because libnativehelper is not in this extension's default lookup scope.
+# The working approach is to dlopen("libnativehelper.so") by soname (permitted for
+# apps on API 31+ as a public NDK library) and dlsym the returned handle -- done in
+# _resolve_get_created_javavms() below. Verified on-device: autoclass round-trips
+# through ART this way (vm.name=Dalvik). On API 24-30 the library is not app-
+# accessible, so a non-SDL host there falls through to the clear RuntimeError; that
+# is acceptable because the SDL path (tiers 1-2) already covers the real target.
 #
 # Why NOT JNI_OnLoad(JavaVM*, void*)?  It is the officially-blessed, all-API way to
 # receive the JavaVM -- BUT Android only calls it for libraries loaded via Java's
@@ -39,11 +43,42 @@
 # host process provides.
 
 cdef extern from "dlfcn.h" nogil:
+    void *dlopen(const char *filename, int flag)
     void *dlsym(void *handle, const char *symbol)
     void *RTLD_DEFAULT
+    int RTLD_NOW
 
 ctypedef JNIEnv *(*_sdl_get_jnienv_t)() noexcept nogil
 ctypedef jint (*_get_created_javavms_t)(JavaVM **, jsize, jsize *) noexcept nogil
+
+
+cdef void *_resolve_get_created_javavms():
+    # JNI_GetCreatedJavaVMs lives in libnativehelper.so (a public NDK library
+    # since API 31 / Android 12). Being a *public* export means it can be linked
+    # or dlopen'd by soname -- it does NOT mean RTLD_DEFAULT reaches it, because
+    # libnativehelper is not in this extension's default lookup scope. Empirically
+    # (cibuildwheel testbed, API 35) the RTLD_DEFAULT lookup returns NULL, so we
+    # explicitly dlopen the public library by name (allowed for apps on API 31+)
+    # and dlsym its handle. dlopen keeps this runtime-only: no DT_NEEDED, so the
+    # wheel still loads on hosts/levels where the library is absent.
+    cdef void *sym = dlsym(RTLD_DEFAULT, b"JNI_GetCreatedJavaVMs")
+    if sym != NULL:
+        return sym
+
+    cdef void *handle = dlopen(b"libnativehelper.so", RTLD_NOW)
+    if handle != NULL:
+        sym = dlsym(handle, b"JNI_GetCreatedJavaVMs")
+        if sym != NULL:
+            return sym
+
+    # Older/alternate runtimes exported it from libart.so; try that too.
+    handle = dlopen(b"libart.so", RTLD_NOW)
+    if handle != NULL:
+        sym = dlsym(handle, b"JNI_GetCreatedJavaVMs")
+        if sym != NULL:
+            return sym
+
+    return NULL
 
 
 cdef JNIEnv *_jnienv_from_sdl():
@@ -65,7 +100,7 @@ cdef JNIEnv *_jnienv_from_created_vm():
     # error. Where it does resolve, it yields the process' existing JavaVM and
     # we attach the current thread to obtain its JNIEnv. Returns NULL if the
     # symbol is absent, no VM has been created, or the attach fails.
-    cdef void *sym = dlsym(RTLD_DEFAULT, b"JNI_GetCreatedJavaVMs")
+    cdef void *sym = _resolve_get_created_javavms()
     if sym == NULL:
         return NULL
 

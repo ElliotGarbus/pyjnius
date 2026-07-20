@@ -37,3 +37,12 @@ archs = ["arm64_v8a", "x86_64"]
 # and covers ~99% of active devices. Set here so it no longer needs a manual
 # `export ANDROID_API_LEVEL=24`.
 environment = { ANDROID_API_LEVEL = "24" }
+
+# On-device smoke test (Step 3). cibuildwheel installs the wheel and runs this in
+# its Android testbed on an emulator (only the build-host arch, x86_64, is tested;
+# arm64_v8a builds but skips on-device tests). The testbed has NO SDL loaded, so a
+# successful autoclass here specifically exercises the tier-3 JNI_GetCreatedJavaVMs
+# fallback (tiers 1-2 dlsym would return NULL without SDL). The default emulator is
+# `--managed maxVersion` (API >= 31), where that symbol is a public export.
+# Android can't run shell scripts, so this must be a `python -c`/`-m` command.
+test-command = "python -c 'import jnius; from jnius import autoclass; S = autoclass(\"java.lang.System\"); vm = S.getProperty(\"java.vm.name\"); vendor = S.getProperty(\"java.vendor\"); ver = S.getProperty(\"java.version\"); assert vm, \"no java.vm.name (JNI round-trip failed)\"; print(\"ANDROID_SMOKE_OK vm.name=%s vendor=%s java.version=%s\" % (vm, vendor, ver))'"
