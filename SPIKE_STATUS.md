@@ -13,7 +13,7 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2, 3 and 4 are done.** The runtime resolver is
+via cross-download. **Steps 2–5 are done.** The runtime resolver is
 three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
 path and the SDL-host path are now confirmed on-device:
 
@@ -32,8 +32,9 @@ extension `dlopen`'d from site-packages does **not** have the host's
 so each tier now `dlopen`s the library **by soname** (`libSDL3.so` / `libSDL2.so` /
 `libnativehelper.so`) and `dlsym`s the handle — same fix tier 3 already needed.
 ELF verification still shows **no** `DT_NEEDED` on any of them (only
-`dlopen`/`dlsym@LIBC`). The one remaining criterion
-(Python-implements-Java-interface round-trip) is not yet done.
+`dlopen`/`dlsym@LIBC`). **Step 5** then proved the last criterion — the
+Python-implements-Java-interface round-trip (`@java_method` → `invoke0`) — on-device,
+with the Java glue delivered **app-side** (bootstrap-template model), not from the wheel.
 
 ---
 
@@ -191,12 +192,13 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
       x86_64 emulator, env via **tier 2 `SDL_AndroidGetJNIEnv`** → `Dalvik`,
       deterministic across relaunches. **SDL3** host not yet exercised (Kivy is
       SDL2; would need an SDL3 host build).
-- [~] Python-implements-Java-interface round-trip — **delivery DECIDED (direction
-      change): the glue ships in kivyforge's bootstrap templates, not the wheel** (see
-      "Java-glue delivery"). Still **unproven end-to-end**: the
-      `@java_method`/`PythonJavaClass` → `invoke0` callback has never been run
-      on-device in any packaging model (Step 4 exercised only one-way `autoclass`).
-      This is now the primary open item — see "What we still need to prove".
+- [x] Python-implements-Java-interface round-trip — **PROVEN on-device (Step 5)** with
+      the glue delivered **app-side** (`android.add_src`, bootstrap-template model), NOT
+      from the wheel. On an API-32 SDL2 emulator a Python `Comparator` was driven by
+      `java.util.Collections.sort` (`compare` called 3×, String args in, `int` return used
+      to sort → `['apple','banana','cherry']`) and a Python `Runnable` was called back via
+      `java.util.concurrent.FutureTask.run()` — both through
+      `NativeInvocationHandler.invoke0`. See "Step 5" below.
 - [x] Reproducible from pinned inputs (locked into `pyproject.toml`
       `[tool.cibuildwheel.android]`; NDK pinned via the cibuildwheel version).
       Caveat: toolchain inputs are pinned, but wheels are not yet *bit-for-bit*
@@ -295,6 +297,47 @@ libnativehelper/libart**, no directly-linked SDL/`JNI_GetCreatedJavaVMs` symbol,
 Not yet exercised: an **SDL3** host (Kivy is SDL2) and **arm64** on real hardware
 (only x86_64 emulator tested).
 
+### Step 5 — glue round-trip via app-side (bootstrap-template) delivery — DONE ✅
+
+Proves the *Python-implements-a-Java-interface* path with the new direction's delivery
+model: the wheel ships **no** Java, and `org.jnius.NativeInvocationHandler` is delivered
+**app-side** exactly as kivyforge will ship it as a bootstrap template.
+
+Harness changes (`~/sdl-host-test/`):
+
+- **Wheel/recipe made Java-free.** The stock p4a `PyjniusRecipe.postbuild_arch` copies
+  `jnius/src/org` into the dex (`ctx.javaclass_dir`). The local `PyjniusSpikeRecipe` now
+  overrides `postbuild_arch` to **skip** that copy (calls the grandparent
+  `PyProjectRecipe.postbuild_arch`), so the recipe contributes no Java.
+- **Glue delivered app-side.** `NativeInvocationHandler.java` lives at
+  `sdl-host-test/javaglue/org/jnius/` and is added via `android.add_src = ./javaglue`
+  → a Gradle `srcDir` (verified: `java {srcDir '.../javaglue'}`; the dist's
+  `src/main/java/.../org/jnius/` copy is gone). So the class in the dex comes **only**
+  from the app-side file.
+- **Round-trip exercised** (`app/main.py`): a Python `java.util.Comparator` driven by
+  `Collections.sort`, and a Python `java.lang.Runnable` driven by
+  `java.util.concurrent.FutureTask.run()`.
+
+Logcat on the API-32 SDL2 emulator:
+
+```
+I pyjnius : JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)
+I python  : SDL_HOST_SMOKE_OK vm.name=Dalvik ...
+I python  : PROXY_COMPARATOR_OK calls=3 ordered=['apple', 'banana', 'cherry']
+I python  : PROXY_RUNNABLE_OK
+I python  : PROXY_ROUNDTRIP_OK
+```
+
+`compare` was invoked 3× with String args and its `int` return drove the sort → the
+full args-in/value-out callback goes through `invoke0`. No `ClassNotFoundException`
+(glue resolved), no CheckJNI abort, process stayed alive.
+
+> **Harness gotcha (not a wheel bug):** the first attempt used `Thread(runnable).run()`
+> and hit a **CheckJNI abort** — pyjnius resolved the single-proxy-arg constructor to
+> `Thread(String)` and passed the proxy as a String. Switched to the unambiguous
+> `FutureTask(Runnable, V)` 2-arg ctor. This is a pyjnius overload-resolution sharp edge
+> to note for kivyforge docs, unrelated to the wheel/glue.
+
 ### Later
 
 - **Java-glue delivery — DECIDED (direction change): plain Java-free wheel; the glue
@@ -383,11 +426,12 @@ draft issue if p4a interop is ever revisited.
 Ordered by importance. The env-resolution work (Steps 2–4) is done; the open items are
 now mostly about the glue path and the new delivery model.
 
-1. **Glue round-trip, glue delivered as a bootstrap file (PRIMARY, never yet proven).**
-   Build an app where `NativeInvocationHandler.java` is delivered as a bootstrap/app Java
-   source (the new model), *not* pulled from the wheel or p4a's recipe, and confirm a
-   `PythonJavaClass`/`@java_method` proxy actually fires `invoke0` on-device. Step 4 only
-   exercised one-way `autoclass`; the proxy path has never run in any packaging model.
+1. ~~**Glue round-trip, glue delivered as a bootstrap file (PRIMARY, never yet proven).**~~
+   **DONE ✅ (Step 5).** Built an app where `NativeInvocationHandler.java` is delivered as
+   an app-side Java source (`android.add_src`, simulating the bootstrap template), *not*
+   from the wheel or p4a's recipe (the recipe's `postbuild_arch` glue copy was overridden
+   off), and confirmed `PythonJavaClass`/`@java_method` proxies fire `invoke0` on-device
+   (Comparator + Runnable). See "Step 5".
 2. **Thread-detach hook fires.** Confirm the `ANDROID_ARGUMENT`-gated
    `threading.Thread.run` wrapper in `jnius/__init__.py` calls `jnius.detach()` on thread
    exit (spawn a Python thread, do a JNI call, let it end, watch logcat). No code to write
