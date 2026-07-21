@@ -17,6 +17,43 @@ the wheels; if it proves hard, document exactly what blocks it.
 
 ---
 
+## Spike outcome & revised direction (2026-07-20)
+
+> This proposal predates the spike and is preserved as the **upstream-facing
+> brief**. The spike validated the core technical bet but **narrowed the scope**.
+> Where this document and the points below disagree, the points below win; the
+> empirical corrections to §3–§4 are also folded in inline. Full status and
+> on-device evidence live in `SPIKE_STATUS.md`.
+
+**Proved on device (incl. real arm64 hardware — Pixel 8a, Android 16 / API 36):**
+the SDL-agnostic wheel builds with no host app present, resolves the `JNIEnv` at
+runtime with **no `DT_NEEDED` on libSDL**, and round-trips both `autoclass` and the
+Python-implements-a-Java-interface path (`@java_method` → `invoke0`). The upstream
+`ANDROID_ARGUMENT` thread-detach hook fires, pyjnius attaches to the host VM without
+`JNI_CreateJavaVM`, and the cibuildwheel wheel is **16 KB-aligned**.
+
+**Direction change (supersedes §1, §3.2, §5, §6, §7.5):**
+
+- **Ship a plain, Java-free wheel.** The `.java/` dot-directory convention
+  (`pyjnius-builder`/`ksproject`) is **dropped** — it is general machinery for
+  arbitrary third-party Java, overkill for pyjnius's one fixed ~40-line file, and
+  unproven at scale. The wheel carries **no Java payload**.
+- **The Java glue moves to kivyforge's bootstrap templates**
+  (`NativeInvocationHandler.java`, delivered like `MainActivity.java` and compiled
+  + dex'd by the app's own Gradle; proven on device via `android.add_src`). The
+  wheel's `invoke0` native-method contract and the bootstrap's copy are a
+  **matched pair** that must be versioned together — nothing enforces it once
+  packaging is out of the loop.
+- **kivyforge is the only target.** p4a/ksproject compatibility and a
+  first-party PyPI publication "serving every packager" are **out of scope**; the
+  upstream PR to `kivy/pyjnius` (SDL-link removal + runtime resolver) is
+  **deferred**.
+- **Still open:** an **SDL3 host** (only SDL2 validated on device; the tier-1 code
+  path is identical), and bootstrap-side 16 KB alignment (a kivyforge toolchain
+  task, not a wheel one).
+
+---
+
 ## 1. Why this is worth doing now
 
 The ecosystem pieces are in place:
@@ -119,7 +156,9 @@ parts, plus a Java-glue delivery problem:
    from Python). A `.whl` carries no `.dex`, so the glue must reach the APK's
    dex. This is **solved by the dot-directory convention**: ship the sources in
    the wheel's `.java/` and let the app's project generator compile/dex them (as
-   `pyjnius-builder` already does).
+   `pyjnius-builder` already does). *(Superseded — the spike drops `.java/` and
+   delivers this glue via the kivyforge bootstrap templates instead; see "Spike
+   outcome & revised direction" above.)*
 
 ## 4. Design decision: one universal wheel for SDL2 *and* SDL3
 
@@ -137,17 +176,26 @@ symbol name plus a hard SDL `DT_NEEDED`. Remove both:
    `DT_NEEDED` on any `libSDL*.so`**. A specific SDL soname is exactly what would
    otherwise lock the wheel to one generation and make it fail to `dlopen`
    against the other.
-2. **Resolve the `JNIEnv` at runtime**, taking whichever is present:
-   - `dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv")` (SDL3), else
-   - `dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")` (SDL2), else
-   - `JNI_GetCreatedJavaVMs` + `AttachCurrentThread` (SDL-independent; also covers
-     non-SDL hosts — and see the existing `get_jni_java_vm` work from PR #710).
+2. **Resolve the `JNIEnv` at runtime**, taking whichever is present (see the
+   empirical correction below for *how* each is resolved):
+   - `SDL_GetAndroidJNIEnv` from `libSDL3.so` (SDL3), else
+   - `SDL_AndroidGetJNIEnv` from `libSDL2.so` (SDL2), else
+   - `JNI_GetCreatedJavaVMs` (from `libnativehelper.so`) + `AttachCurrentThread` —
+     SDL-independent, **API 31+ only** (public libnativehelper export since S; see
+     PR #710's `get_jni_java_vm` for related work).
 
-   Because a Kivy/SDL host loads its SDL into the app's global linker namespace
-   before Python imports pyjnius, `RTLD_DEFAULT` finds whichever getter exists.
-   The dlsym-of-SDL path is the sure one (it is how p4a resolves the env today);
-   the `JNI_GetCreatedJavaVMs` fallback is a bonus whose dlsym-resolvability
-   varies by API level/runtime, so treat it as best-effort, not the primary.
+   **Empirical correction (spike, on device — supersedes the original claim that
+   `RTLD_DEFAULT` suffices):** a CPython extension `dlopen`'d from site-packages does
+   **not** have the host's `System.loadLibrary`'d SDL (nor `libnativehelper`) in its
+   default lookup scope, so `dlsym(RTLD_DEFAULT, …)` returns **NULL** even though the
+   library is resident and exports the symbol. Each tier therefore tries
+   `RTLD_DEFAULT` first, then **`dlopen`s the library by soname** (`libSDL3.so` /
+   `libSDL2.so` / `libnativehelper.so` — already loaded in the app's linker
+   namespace, so `dlopen` just returns a handle + refcount) and `dlsym`s that handle.
+   This stays runtime-only: **no `DT_NEEDED`** on any of them. The SDL path (tiers
+   1–2) carries API 24–30; tier 3 adds SDL-independence on API 31+. `JNI_OnLoad`
+   inside the wheel is **not** usable (ART never calls it for a `.so` imported via
+   `dlopen`, not `System.loadLibrary`). See `SPIKE_STATUS.md` (Steps 2–4, 7).
 
 This is a small, low-risk change to `jnius/env.py` (drop SDL from linked libs)
 plus a few lines of runtime resolution in `jnius_jvm_android.pxi`. It weakens the
@@ -177,7 +225,8 @@ it is what downstream packagers guarantee):
 - The wheel's `.java/` glue is compiled and dexed into the APK, with the
   **`org.kivy.android.*` namespace preserved** so that
   `autoclass('org.kivy.android.PythonActivity')` and Plyer-style access keep
-  working unmodified.
+  working unmodified. *(Superseded: the wheel ships no Java; the glue is a
+  kivyforge bootstrap template — see "Spike outcome & revised direction".)*
 - **Fail loudly**: a missing JVM/glue should raise a clear `ImportError`
   ("pyjnius' Android wheel needs a host that provides an in-process JVM; see
   <link>"), not a cryptic dlopen/symbol failure — so e.g. a Termux user gets
@@ -209,8 +258,10 @@ the p4a maintainers keeps *one* contract rather than per-bootstrap variants.
   fallback** if the runtime lookup proves too fiddly.
 - Deliver the Java glue via the **dot-directory convention** (`.java/` in the
   wheel) and document the residual host contract (§5).
-- **Pre-generate `jnius.c` from `jnius.pyx`** at build/pin time so Cython is not
-  a build dependency for consumers of the wheel.
+- Cython runs only at **wheel-build** time; consumers of a prebuilt-`.so` wheel
+  never need it. (The spike lets cibuildwheel cythonize `.pyx`/`.pxi` at build
+  time rather than pre-generating and shipping a stale `jnius.c` — the latter
+  risks compiling the stale `.c` instead of our `.pxi` changes.)
 - A reproducible cibuildwheel-based build (pin the NDK/API level).
 
 **Out of scope**
@@ -253,7 +304,8 @@ the p4a maintainers keeps *one* contract rather than per-bootstrap variants.
      `DT_NEEDED`; document the exact linker flags (allow the resolver's symbols
      to remain undefined/resolved at runtime).
    - Implement the runtime `JNIEnv` resolver in `jnius_jvm_android.pxi`
-     (`dlsym` SDL3 name → SDL2 name → `JNI_GetCreatedJavaVMs`).
+     (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`); each tier tries `dlsym(RTLD_DEFAULT)`
+     then `dlopen(soname)` + `dlsym` (see §4's empirical correction).
    - **Fallback:** if runtime lookup is impractical, apply p4a's
      `sdl3_jnienv_getter.patch` and link SDL3 as an external, host-provided
      library (do not bundle/graft `libSDL3.so`).
@@ -337,6 +389,13 @@ made with evidence.
   accordingly.
 - **Toolchain drift:** NDK/SDK/build-tools versions roll forward and drop old
   ones. **Pin them**, and make the pin easy to refresh.
+- **16 KB page alignment (Android 15+/16):** native `.so`s need 16 KB LOAD-segment
+  alignment or they fail to load on 16 KB-page devices (and warn on others). The
+  cibuildwheel wheel is already 16 KB-aligned (NDK r28-series default, verified);
+  an NDK r27 build (e.g. the p4a test harness) is only 4 KB-aligned. Align
+  bootstrap/host libs with **NDK r28+** or `-Wl,-z,max-page-size=16384`, and 16 KB
+  zip-align the APK. This is a *bootstrap/toolchain* task, not a wheel change.
+  (Spike finding; see `SPIKE_STATUS.md` Step 7.)
 - **Do not regress** desktop/other-platform builds.
 
 ## 11. References
