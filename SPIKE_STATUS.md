@@ -37,6 +37,31 @@ ELF verification still shows **no** `DT_NEEDED` on any of them (only
 
 ---
 
+## Direction & scope (updated 2026-07-20)
+
+**kivyforge is the only target.** The wheel is no longer chasing portability across
+build systems (p4a / ksproject compatibility is explicitly a non-concern — they build
+pyjnius from source, not a wheel, and kivyforge aims to displace p4a). Concretely:
+
+- **Ship a plain, Java-free Python wheel** — patched pyjnius source (SDL link removed,
+  `get_libraries()` → `['log']`, runtime SDL-getter JNIEnv resolver) → cibuildwheel →
+  `arm64-v8a` (and `x86_64` for the emulator). No Java payload, no `.java/` machinery.
+- **JNIEnv acquisition stays the validated SDL-getter resolver** (Step 4). The wheel's
+  `.so` finds the SDL-provided VM itself via `dlopen(libSDL*.so)` + `dlsym`, so it needs
+  **nothing from the bootstrap for the env**. (Note: "JNI_OnLoad inside the wheel" is
+  *not* used and is not possible — ART never calls `JNI_OnLoad` for a `.so` imported by
+  CPython via `dlopen`.)
+- **The Java glue moves to kivyforge's bootstrap templates.** `NativeInvocationHandler.java`
+  is generated/delivered like `MainActivity.java` / `PythonActivity.java` and compiled +
+  dex'd by the app's own Gradle. This **supersedes** the earlier `.java/` dot-directory
+  decision and makes the p4a-consumption work (and its draft issue) obsolete.
+- **Upstream PR to `kivy/pyjnius`: deferred** — revisit after the glue round-trip is proven.
+
+Superseded below (kept only for history, marked as such): the `.java/` Java-glue
+decision, the consumer-compatibility matrix, and the draft p4a issue appendix.
+
+---
+
 ## Environment (WSL2)
 
 - Host: **WSL2, Ubuntu 26.04 LTS, x86_64**
@@ -166,12 +191,12 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
       x86_64 emulator, env via **tier 2 `SDL_AndroidGetJNIEnv`** → `Dalvik`,
       deterministic across relaunches. **SDL3** host not yet exercised (Kivy is
       SDL2; would need an SDL3 host build).
-- [~] Python-implements-Java-interface round-trip — **delivery convention now
-      SETTLED** (Option B: ship the glue as source in a `.java/` dot-directory; see
-      "Java-glue delivery" below). The wheel side is defined; demonstrating the
-      round-trip on-device is gated on consumer-side glue routing (p4a needs the
-      `.java/`-extraction change in the appended draft issue; `ksproject` already
-      extracts `.java/`).
+- [~] Python-implements-Java-interface round-trip — **delivery DECIDED (direction
+      change): the glue ships in kivyforge's bootstrap templates, not the wheel** (see
+      "Java-glue delivery"). Still **unproven end-to-end**: the
+      `@java_method`/`PythonJavaClass` → `invoke0` callback has never been run
+      on-device in any packaging model (Step 4 exercised only one-way `autoclass`).
+      This is now the primary open item — see "What we still need to prove".
 - [x] Reproducible from pinned inputs (locked into `pyproject.toml`
       `[tool.cibuildwheel.android]`; NDK pinned via the cibuildwheel version).
       Caveat: toolchain inputs are pinned, but wheels are not yet *bit-for-bit*
@@ -272,11 +297,14 @@ Not yet exercised: an **SDL3** host (Kivy is SDL2) and **arm64** on real hardwar
 
 ### Later
 
-- **Java-glue delivery — DECIDED: option B (`.java/` dot-directory, source only).**
-  See the dedicated section below.
+- **Java-glue delivery — DECIDED (direction change): plain Java-free wheel; the glue
+  (`NativeInvocationHandler.java`) lives in kivyforge's bootstrap templates.** See
+  "Java-glue delivery" below. (Supersedes the earlier `.java/` dot-directory decision.)
 - ~~Lock the pins into a `[tool.cibuildwheel]` config in `pyproject.toml`.~~ DONE ✅
-- Write the findings deliverable and prepare the upstream PR (`origin` already
-  points at the fork; `upstream` at `kivy/pyjnius`).
+- Prove the glue round-trip (`PythonJavaClass`/`@java_method`) with the glue delivered
+  as a bootstrap file — see "What we still need to prove".
+- Upstream PR to `kivy/pyjnius` (SDL-link removal + runtime resolver): **deferred** —
+  decide after the glue round-trip is proven.
 
 ## Java-glue delivery — decision & consumer compatibility
 
@@ -293,68 +321,82 @@ findable by the classloader pyjnius uses — a `.whl` carries no `.dex`, so the
 source (or a compiled form) must reach the app's dex step. It cannot be eliminated:
 a `java.lang.reflect.Proxy` handler can't be built from pure Python.
 
-### Decision: option B — ship source in the `.java/` dot-directory
+### Decision (updated 2026-07-20): plain Java-free wheel + glue in the kivyforge bootstrap
 
-The wheel emits `.java/org/jnius/NativeInvocationHandler.java`; a generic consumer
-scans installed wheels for `.java/` and adds it to the AGP source set, letting
-Gradle compile+dex it. Chosen over the alternatives because it is:
+**Direction change.** Earlier this spike chose option B — ship the glue as source in a
+`.java/` dot-directory for a generic downstream extractor (`pyjnius-builder`/`ksproject`).
+That is now **dropped**. kivyforge is the only target, so:
 
-- **generic** — no per-package special-casing in the consumer (any wheel can carry
-  glue the same way); this is what `pyjnius-builder` emits and `ksproject` consumes;
-- **coupling-free** — shipping *source* (not `.class`/`.jar`/`.dex`) lets AGP build
-  it against the app's own `compileSdk`/Java level, so no bytecode/dex/toolchain
-  version mismatch;
-- **self-describing & single-artifact** — pyjnius stays one PyPI wheel; the app
-  author declares nothing.
+- **The wheel ships no Java at all** — just the patched pyjnius Python + `.so` (SDL link
+  removed, `get_libraries()` → `['log']`, runtime SDL-getter resolver validated in Step 4).
+- **`NativeInvocationHandler.java` becomes a kivyforge bootstrap template**, generated/
+  delivered like `MainActivity.java` / `PythonActivity.java`, so the app's own Gradle/AGP
+  compiles + dex'es it into the APK.
 
-Also: **drop the precompiled `.class`** currently shipped alongside the `.java`
-(desktop-targeted bytecode, re-dex'd anyway, a version footgun). Open sub-items:
-align the `.java/` convention with kivy-school/p4a (one convention, not three), and
-choose the emit mechanism (port `pyjnius-builder`'s PEP 517 backend, or a minimal
-`setup.py`/wheel step that relocates `jnius/src/org/...` → `.java/org/...`).
+Why the change:
 
-### Consumer compatibility (same wheel for all three)
+- **Wrong tool for the problem.** The `.java/` convention is general machinery for
+  arbitrary, unpredictable third-party Java. pyjnius needs one small, fixed ~40-line file.
+- **Unproven at scale.** No real package — pyjnius included — actually uses
+  `pyjnius-builder`/`ksp-builder` today; it targets a hypothetical future plugin ecosystem.
+- **The wheel is self-sufficient for the env.** The `.so` resolves the JNIEnv itself via
+  the SDL getter (Step 4), so it needs nothing from the bootstrap for the env — the *only*
+  thing the bootstrap must supply is the Java glue. Putting it in the templates keeps that
+  in one place kivyforge already owns.
+- **Not contradicted by desktop precedent.** Desktop pyjnius bundles a *compiled* `.class`
+  inside its own namespace, self-consumed by its self-created JVM — a different mechanism,
+  not prior art for cross-build-system source injection.
 
-The binary half (`.so` + Python) works everywhere as-is; only the *glue* half
-differs. The `.java/` payload is inert to consumers that don't read it (e.g. p4a
-drops it in site-packages, harmless), so **one wheel serves all three** — no fork.
+**Matched-pair coupling (must document — nothing enforces it).** The wheel's `invoke0`
+native-method contract and the bootstrap's `NativeInvocationHandler.java` are a matched
+pair that must move together. With `.java/` gone, no packaging step catches drift.
+Mitigations: pyjnius already resolves `autoclass('org.jnius.NativeInvocationHandler')` at
+proxy-creation, so a mismatch surfaces as a clear `ClassNotFound`/`NoSuchMethod` at first
+use (not silent corruption); add a version comment in **both** the wheel build script and
+the bootstrap template, and consider a runtime version-constant check.
 
-| Consumer | Binary (`.so`) | Glue (`.java/`) | Work needed |
-|---|---|---|---|
-| **ksproject** | ✅ as-is | ✅ as-is (already extracts `.java/`) | none |
-| **kivyforge** | ✅ as-is | needs a `.java/` extractor | **our side** (planned Android backend) |
-| **p4a** | ✅ as-is (prebuilt-wheel support, v2026.05.09 / PR #3280) | not consumed from the wheel | **upstream p4a** (see below) |
+### Runtime notes (audited from the real wheel; no code changes needed)
 
-`autoclass`-only usage works on all three today with no glue.
+- **Thread-detach hook is already upstream.** `jnius/__init__.py` (unmodified, every
+  release; lines 75–89 here) installs an `ANDROID_ARGUMENT`-gated `threading.Thread.run`
+  wrapper that calls `jnius.detach()` on thread exit — correct JNI hygiene. kivyforge's
+  bootstrap already sets `ANDROID_ARGUMENT`, so this works for free. **Do not
+  reimplement**; just confirm it fires during smoke-testing.
+- **`env` / `jnius_config` are runtime-inert on Android — but `env` is build-time
+  load-bearing.** `setup.py` imports `jnius_config/env.py` for `get_libraries()` → `['log']`
+  (the SDL-link removal). At *runtime*, `jnius/__init__.py` imports `get_java_setup` but
+  only uses it on `win32`; `jnius_config.py` (classpath/JVM options) is moot because the
+  wheel never calls `JNI_CreateJavaVM` — it attaches to the bootstrap's existing VM.
+  Document as runtime-inert; no code change.
 
-### Work required for p4a to fully consume the wheel
+### Superseded — `.java/` decision & p4a consumption (history)
 
-Context: p4a **already** installs prebuilt Android wheels (`PyProjectRecipe`,
-v2026.05.09, PR #3280: `--extra-index-url`, `--use-prebuilt-version-for`,
-`--skip-prebuilt`). But `install_prebuilt_wheel`/`install_wheel` extract the wheel
-**only** into `get_python_install_dir` (site-packages) — they do **not** route a
-wheel's `.java/` into the app's Java source set / dex. So the glue-dependent
-feature raises the classic `ClassNotFoundException: org.jnius.NativeInvocationHandler`
-unless one of the following is done:
+The prior direction shipped the glue as source in a `.java/` dot-directory so any generic
+consumer (`ksproject` as-is, kivyforge/p4a with an extractor) could route it into the dex
+step, and included a draft p4a issue asking the maintainer to teach the prebuilt-wheel
+installer to extract `.java/`. **All of that is obsolete** under the kivyforge-only,
+Java-free-wheel direction. See git history (pre-2026-07-20) for the full matrix and the
+draft issue if p4a interop is ever revisited.
 
-1. **Preferred — generic `.java/` extraction in p4a's wheel-install path.** When a
-   wheel contains a top-level `.java/` dir, copy its tree into the bootstrap's Java
-   sources before the Gradle/dex step (the same contract ksproject uses). This is
-   package-agnostic: it fixes pyjnius *and every future glue-carrying wheel*, and
-   converges p4a + ksproject + kivyforge on one convention. (Symmetry note: p4a
-   already has prior art for wheel-carried native dirs; `.java/` is the Java analog
-   of `.libs/<abi>/`.)
-2. **Localized alternative — update the pyjnius recipe.** Keep a slim pyjnius
-   `PyProjectRecipe` that consumes the prebuilt `.so` wheel but still injects the
-   glue source it already ships (`add_src`-style), avoiding a duplicate-class
-   clash with any wheel-provided copy.
-3. **Interim/no-p4a-change fallback:** the app author sets
-   `android.add_src = .../NativeInvocationHandler.java` (today's manual workaround).
+## What we still need to prove (updated direction)
 
-Recommended ask to the maintainer: **option 1** — teach the prebuilt-wheel
-installer to extract a wheel's `.java/` (and, while there, confirm `.libs/<abi>/`
-handling) into the dex path. Small, generic, and unblocks the whole wheel-only
-Android story, not just pyjnius.
+Ordered by importance. The env-resolution work (Steps 2–4) is done; the open items are
+now mostly about the glue path and the new delivery model.
+
+1. **Glue round-trip, glue delivered as a bootstrap file (PRIMARY, never yet proven).**
+   Build an app where `NativeInvocationHandler.java` is delivered as a bootstrap/app Java
+   source (the new model), *not* pulled from the wheel or p4a's recipe, and confirm a
+   `PythonJavaClass`/`@java_method` proxy actually fires `invoke0` on-device. Step 4 only
+   exercised one-way `autoclass`; the proxy path has never run in any packaging model.
+2. **Thread-detach hook fires.** Confirm the `ANDROID_ARGUMENT`-gated
+   `threading.Thread.run` wrapper in `jnius/__init__.py` calls `jnius.detach()` on thread
+   exit (spawn a Python thread, do a JNI call, let it end, watch logcat). No code to write
+   — just verify the assumption empirically.
+3. **`jnius_config`/`env` inert at runtime.** Confirm no `JNI_CreateJavaVM` path is taken
+   and nothing in `jnius_config.py`/`env` misbehaves on Android (expected: attaches to the
+   bootstrap VM only). Mostly a confirmation.
+4. **Coverage gaps carried over from Step 4:** an **SDL3** host (Kivy is SDL2) and
+   **arm64 on real hardware** (only x86_64 emulator exercised).
 
 ## Open risks to settle empirically
 
@@ -376,80 +418,11 @@ Android story, not just pyjnius.
 
 ---
 
-## Appendix — draft p4a issue (file *after* the pyjnius wheel PR is up)
+## Appendix — draft p4a issue — OBSOLETE (removed 2026-07-20)
 
-Ready to paste into `kivy/python-for-android`. Fill in `<PYJNIUS_PR>` /
-`<WHEEL_INDEX_URL>` once the pyjnius PR and published wheel exist.
-
-**Title:** Prebuilt Android wheels: extract a wheel's `.java/` glue into the bootstrap dex path
-
-**Body:**
-
-### Summary
-
-p4a's prebuilt-wheel install path installs a wheel's Python/`.so` payload but drops
-any Java glue the wheel carries, so packages that need a companion Java class (e.g.
-pyjnius' `org.jnius.NativeInvocationHandler`) fail at runtime with
-`ClassNotFoundException` even though the wheel ships the source. Proposal: when an
-installed wheel contains a top-level `.java/` directory, copy its tree into the
-bootstrap's Java sources before the Gradle/dex step.
-
-### Background
-
-Prebuilt Android wheel support landed in v2026.05.09 (#3280): `PyProjectRecipe`
-installs a compatible prebuilt wheel when available (`--extra-index-url`,
-`--use-prebuilt-version-for`, `--skip-prebuilt`). This works for the binary:
-`import`/`autoclass` and method calls succeed.
-
-First-party pyjnius Android wheels (see `<PYJNIUS_PR>`) are **universal / SDL-agnostic**
-and resolve the `JNIEnv` at runtime (dlsym `SDL_GetAndroidJNIEnv`/`SDL_AndroidGetJNIEnv`,
-else `dlopen(libnativehelper.so)` + `JNI_GetCreatedJavaVMs`), so the `.so` needs no
-per-app source build. The remaining coupling is the Java glue.
-
-### The problem
-
-`install_prebuilt_wheel()` / `install_wheel()` extract the wheel **only** into
-`get_python_install_dir(arch)` (site-packages). A wheel's top-level `.java/` thus
-lands at `site-packages/.java/` and is never routed into the bootstrap's Java
-sources, so it is not compiled/dex'd into the APK. Result — the long-standing:
-
-```
-jnius.jnius.JavaException: JVM exception occurred:
-Didn't find class "org.jnius.NativeInvocationHandler" ... ClassNotFoundException
-```
-
-This only affects the *Python-implements-a-Java-interface* feature (`PythonJavaClass`,
-`@java_method`, and anything built on it such as parts of Plyer); plain `autoclass`
-usage is unaffected.
-
-### Proposed fix (generic, package-agnostic)
-
-In the prebuilt-wheel install path, after extracting a wheel, if it contains a
-top-level `.java/` directory, copy its tree into the bootstrap's Java source set
-(the location already fed to Gradle/`javac`/dex). Notes:
-
-- **Source, not bytecode:** Gradle compiles it against the app's own `compileSdk`/Java
-  level — no `.class`/dex/toolchain-version coupling.
-- **Preserve package paths** (`.java/org/jnius/...` → `org/jnius/...`).
-- **Java analog of `.libs/<abi>/`:** worth confirming/settling `.libs/<abi>/`
-  handling on the prebuilt-wheel path in the same change.
-- **One convention:** this is the same `.java/` dot-directory contract that
-  `pyjnius-builder` emits and `ksproject` consumes, so p4a, ksproject and other
-  wheel-native generators converge on a single mechanism — and it fixes *every*
-  future glue-carrying wheel, not just pyjnius.
-
-### Alternatives considered
-
-1. **Recipe injects glue:** a slim pyjnius `PyProjectRecipe` consumes the prebuilt
-   `.so` wheel but still `add_src`'s its own glue. Works, but pyjnius-specific and
-   risks a duplicate-class clash with a wheel-provided copy.
-2. **Manual `android.add_src = .../NativeInvocationHandler.java`:** today's
-   workaround; keeps failing for users who don't know to do it.
-
-### References
-
-- pyjnius universal Android wheel: `<PYJNIUS_PR>`
-- Prebuilt wheel support: #3280 (v2026.05.09)
-- `.java/` convention prior art: kivy-school `pyjnius-builder` (emits `.java/`),
-  `ksproject` (extracts `.java/`, `.libs/<abi>/`, `.gradle/*.json`)
-- Historical glue `ClassNotFoundException`: kivy/pyjnius#137, #223, #645
+The draft `kivy/python-for-android` issue (asking the maintainer to teach the
+prebuilt-wheel installer to extract a wheel's `.java/` glue into the bootstrap dex
+path) is **obsolete**: p4a consumption is a non-concern under the kivyforge-only,
+Java-free-wheel direction, and there is no longer any `.java/` payload to extract.
+The full draft text is preserved in git history (pre-2026-07-20) should p4a interop
+ever be revisited.
