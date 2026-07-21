@@ -13,15 +13,27 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2 and 3 are done.** The runtime resolver is three-tier
-(SDL3 → SDL2 → `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs`), and the wheel
-**imports and round-trips through ART on an emulator** (Step 3): the cibuildwheel
-Android testbed on an API-35 x86_64 emulator ran
-`autoclass('java.lang.System').getProperty('java.vm.name')` → **`Dalvik`** (vendor
-`The Android Project`), with the `JNIEnv` obtained via the SDL-independent tier-3
-fallback. ELF verification confirms the resolver added **no** `DT_NEEDED`
-(no libSDL, no libnativehelper, no libart — only `dlopen`/`dlsym@LIBC`). The one
-remaining criterion (Python-implements-Java-interface round-trip) is not yet done.
+via cross-download. **Steps 2, 3 and 4 are done.** The runtime resolver is
+three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
+path and the SDL-host path are now confirmed on-device:
+
+- **Step 3 (SDL-less):** the cibuildwheel Android testbed on an API-35 x86_64
+  emulator ran `autoclass('java.lang.System').getProperty('java.vm.name')` →
+  **`Dalvik`**, `JNIEnv` via the tier-3 `dlopen(libnativehelper)` fallback.
+- **Step 4 (real SDL2 host):** a **buildozer/p4a Kivy app** (SDL2 bootstrap) built
+  against this source and run on an **API-32 x86_64 emulator** resolved the env via
+  **tier 2 (`SDL_AndroidGetJNIEnv`)** and round-tripped to `Dalvik` — deterministic
+  across relaunches.
+
+**KEY CORRECTION from Step 4:** the original premise that a host-loaded SDL getter
+is reachable via `dlsym(RTLD_DEFAULT, …)` is **false on device**. A CPython
+extension `dlopen`'d from site-packages does **not** have the host's
+`System.loadLibrary`'d SDL in its default lookup scope (empirically NULL on API 32),
+so each tier now `dlopen`s the library **by soname** (`libSDL3.so` / `libSDL2.so` /
+`libnativehelper.so`) and `dlsym`s the handle — same fix tier 3 already needed.
+ELF verification still shows **no** `DT_NEEDED` on any of them (only
+`dlopen`/`dlsym@LIBC`). The one remaining criterion
+(Python-implements-Java-interface round-trip) is not yet done.
 
 ---
 
@@ -147,11 +159,13 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
 
 - [x] Builds `android_24_arm64_v8a` **and** `android_24_x86_64`, no host app present
 - [x] `pip install` cross-download installs cleanly
-- [x] Imports/runs on an emulator/device — **SDL-less path only.** cibuildwheel
-      testbed, API-35 x86_64 emulator: `autoclass('java.lang.System')` resolved and
-      `getProperty('java.vm.name')` returned `Dalvik`, env via the tier-3
-      `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs` fallback. The SDL-host
-      path (SDL2 *and* SDL3) still needs a real minimal SDL/Kivy Gradle app.
+- [x] Imports/runs on an emulator/device — **both paths confirmed.**
+      (a) SDL-less: cibuildwheel testbed, API-35 x86_64 emulator, env via tier-3
+      `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs` → `Dalvik`.
+      (b) Real SDL2 host: buildozer/p4a Kivy app (SDL2 bootstrap) on an API-32
+      x86_64 emulator, env via **tier 2 `SDL_AndroidGetJNIEnv`** → `Dalvik`,
+      deterministic across relaunches. **SDL3** host not yet exercised (Kivy is
+      SDL2; would need an SDL3 host build).
 - [~] Python-implements-Java-interface round-trip — **delivery convention now
       SETTLED** (Option B: ship the glue as source in a `.java/` dot-directory; see
       "Java-glue delivery" below). The wheel side is defined; demonstrating the
@@ -220,11 +234,41 @@ normal — `java.vm.*` carries the real info.) Test config lives in
 > libSDL/libnativehelper/libart; only `dlopen`/`dlsym@LIBC`). After this change the
 > testbed passes.
 
-### Known gotcha — test-harness mismatch (still true)
+### Step 4 — real SDL2 host on device — DONE ✅
 
-cibuildwheel's testbed has **no SDL loaded**, so only the tier-3 path is exercised
-there, not the SDL getters. Exercising the SDL path (SDL2 *and* SDL3) requires a
-real minimal SDL/Kivy Gradle app — the remaining piece for the on-device criterion.
+cibuildwheel's testbed has **no SDL loaded**, so Step 3 only exercised tier 3, not
+the SDL getters. Step 4 closes that gap with a real SDL2 host: a minimal
+**buildozer/p4a Kivy app** (`~/sdl-host-test/`, SDL2 bootstrap) built against *this*
+source (via `P4A_pyjnius_DIR` + a local recipe that drops p4a's link-time getter
+patches and keeps `use_cython.patch`) and run on an **API-32 x86_64 emulator**
+(`pyjnius_x86_64` AVD). A one-line `__android_log_print` in the resolver reports the
+winning tier to logcat:
+
+```
+I pyjnius : JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)
+I python  : SDL_HOST_SMOKE_OK vm.name=Dalvik vendor=The Android Project java.version=0
+```
+
+Deterministic across relaunches. ELF re-check of the p4a-built `jnius.so`: `NEEDED`
+= only `libpython3.14.so`, `liblog.so`, `libdl.so`, `libc.so` — **no libSDL/
+libnativehelper/libart**, no directly-linked SDL/`JNI_GetCreatedJavaVMs` symbol,
+`dlopen`/`dlsym@LIBC` present.
+
+> **KEY CORRECTION (changed the SDL path too).** The first Step-4 run resolved via
+> **tier 3**, not the SDL getter, even though libSDL2 was loaded — i.e.
+> `dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")` returned NULL. This falsifies the
+> spike's original premise (a host-loaded SDL symbol is reachable via
+> `RTLD_DEFAULT`). Same root cause as tier 3: an extension `dlopen`'d from
+> site-packages does not have the host's `System.loadLibrary`'d SDL in its default
+> lookup scope. Fix: `_resolve_sdl_getter()` now tries `RTLD_DEFAULT` first, then
+> **`dlopen`s the SDL soname** (`libSDL3.so`/`libSDL2.so`) and `dlsym`s the handle
+> — still runtime-only, no `DT_NEEDED`. After this change tier 2 fires. On API
+> 24–30 (no tier 3) this SDL path is what carries the wheel; the dlopen-by-soname
+> approach works on those levels because libSDL* is an app lib in the app linker
+> namespace.
+
+Not yet exercised: an **SDL3** host (Kivy is SDL2) and **arm64** on real hardware
+(only x86_64 emulator tested).
 
 ### Later
 
@@ -321,8 +365,14 @@ Android story, not just pyjnius.
   `libnativehelper.so` by soname. With that, ART round-trip confirmed on an API-35
   emulator. Best-effort tier 3 (API 31+); SDL path (tiers 1–2) carries API 24–30.
   A 24–30 non-SDL check would just confirm the documented fall-through to RuntimeError.
-- Does `dlsym(RTLD_DEFAULT, ...)` find a host-loaded SDL getter on bionic at the
-  target API levels? (needs a real SDL host to confirm.)
+- ~~Does `dlsym(RTLD_DEFAULT, ...)` find a host-loaded SDL getter on bionic at the
+  target API levels?~~ **SETTLED EMPIRICALLY (Step 4): NO.** On a real p4a SDL2
+  host (API 32) `dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")` returned NULL despite
+  libSDL2 being loaded — an extension `dlopen`'d from site-packages doesn't see the
+  host's `System.loadLibrary`'d SDL in its default scope. Fix applied: `dlopen` the
+  SDL soname (`libSDL3.so`/`libSDL2.so`) and `dlsym` the handle (like tier 3). With
+  that, tier 2 resolves and round-trips to `Dalvik`. Still open: **SDL3** host and
+  **arm64 on real hardware** (only SDL2 + x86_64 emulator exercised so far).
 
 ---
 

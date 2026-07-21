@@ -6,15 +6,25 @@
 #
 # Instead we resolve the env at *runtime*, in order of preference:
 #
-#   1. dlsym(RTLD_DEFAULT, "SDL_GetAndroidJNIEnv")  -- SDL3 (primary; all API levels)
-#   2. dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv")  -- SDL2 (primary; all API levels)
-#   3. dlopen("libnativehelper.so") + JNI_GetCreatedJavaVMs -- SDL-independent, API 31+
+#   1. SDL_GetAndroidJNIEnv  from libSDL3.so  -- SDL3 (primary; all API levels)
+#   2. SDL_AndroidGetJNIEnv  from libSDL2.so  -- SDL2 (primary; all API levels)
+#   3. JNI_GetCreatedJavaVMs from libnativehelper.so -- SDL-independent, API 31+
 #
 # Tiers 1-2 are the primary path and work on every supported API level: a Kivy/SDL
 # host loads its SDL library via System.loadLibrary before ``import jnius``, so
 # SDL's own JNI_OnLoad has captured the JavaVM, and SDL re-exposes it as the getter
-# we dlsym here. This is the only viable mechanism for a *dlopen'd* CPython
+# we resolve here. This is the only viable mechanism for a *dlopen'd* CPython
 # extension (see the JNI_OnLoad note below).
+#
+# How the getter is resolved matters. EMPIRICAL FINDING (p4a SDL2 host, API 32):
+# dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv") returns NULL even though libSDL2.so
+# is loaded and exports it -- this .so is a CPython extension dlopen'd from
+# site-packages, and the host's System.loadLibrary'd SDL is NOT in its default
+# lookup scope. So each tier tries RTLD_DEFAULT first, then dlopen's the library by
+# soname (libSDL3.so / libSDL2.so / libnativehelper.so -- all already resident in
+# the app linker namespace, so dlopen just returns a handle) and dlsym's that
+# handle. dlopen keeps everything runtime-only: no DT_NEEDED on any of them. This
+# is the same fix tier 3 needed for libnativehelper (see below).
 #
 # Tier 3 is a *best-effort* fallback for non-SDL hosts (and cibuildwheel's SDL-less
 # testbed). JNI_GetCreatedJavaVMs became a public libnativehelper export only in
@@ -89,15 +99,33 @@ cdef void *_resolve_get_created_javavms():
     return NULL
 
 
+cdef void *_resolve_sdl_getter(const char *name, const char *soname):
+    # Resolve an SDL JNIEnv getter by symbol name. EMPIRICAL FINDING (p4a SDL2
+    # host, API 32): dlsym(RTLD_DEFAULT, "SDL_AndroidGetJNIEnv") returns NULL even
+    # though libSDL2.so is resident -- a CPython extension dlopen'd from
+    # site-packages does not have the host's System.loadLibrary'd SDL in its
+    # default lookup scope. So try RTLD_DEFAULT first (works where SDL is global),
+    # then dlopen the SDL soname by name (already loaded in the app linker
+    # namespace; dlopen just returns a handle + refcount) and dlsym that handle.
+    # dlopen keeps this runtime-only: no DT_NEEDED on any libSDL.
+    cdef void *sym = dlsym(RTLD_DEFAULT, name)
+    if sym != NULL:
+        return sym
+    cdef void *handle = dlopen(soname, RTLD_NOW)
+    if handle != NULL:
+        return dlsym(handle, name)
+    return NULL
+
+
 cdef JNIEnv *_jnienv_from_sdl():
     # SDL3 renamed the getter (SDL_AndroidGetJNIEnv -> SDL_GetAndroidJNIEnv); try
     # SDL3 first, then SDL2. Returns NULL if neither getter is in the process.
-    cdef void *sym = dlsym(RTLD_DEFAULT, b"SDL_GetAndroidJNIEnv")
+    cdef void *sym = _resolve_sdl_getter(b"SDL_GetAndroidJNIEnv", b"libSDL3.so")
     if sym != NULL:
         __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
                             b"JNIEnv source: tier 1 SDL3 (SDL_GetAndroidJNIEnv)")
         return (<_sdl_get_jnienv_t>sym)()
-    sym = dlsym(RTLD_DEFAULT, b"SDL_AndroidGetJNIEnv")
+    sym = _resolve_sdl_getter(b"SDL_AndroidGetJNIEnv", b"libSDL2.so")
     if sym != NULL:
         __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
                             b"JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)")
