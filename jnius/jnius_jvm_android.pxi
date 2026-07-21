@@ -48,6 +48,14 @@ cdef extern from "dlfcn.h" nogil:
     void *RTLD_DEFAULT
     int RTLD_NOW
 
+# SPIKE-ONLY instrumentation: log which resolution tier produced the JNIEnv so an
+# on-device run can be confirmed via `adb logcat -s pyjnius`. liblog is already a
+# link input (see jnius_config/env.py AndroidJavaLocation -> ['log']). Decide at
+# PR time whether to keep this (as DEBUG) or drop it.
+cdef extern from "android/log.h" nogil:
+    int __android_log_print(int prio, const char *tag, const char *fmt, ...)
+    enum: ANDROID_LOG_INFO
+
 ctypedef JNIEnv *(*_sdl_get_jnienv_t)() noexcept nogil
 ctypedef jint (*_get_created_javavms_t)(JavaVM **, jsize, jsize *) noexcept nogil
 
@@ -85,11 +93,16 @@ cdef JNIEnv *_jnienv_from_sdl():
     # SDL3 renamed the getter (SDL_AndroidGetJNIEnv -> SDL_GetAndroidJNIEnv); try
     # SDL3 first, then SDL2. Returns NULL if neither getter is in the process.
     cdef void *sym = dlsym(RTLD_DEFAULT, b"SDL_GetAndroidJNIEnv")
-    if sym == NULL:
-        sym = dlsym(RTLD_DEFAULT, b"SDL_AndroidGetJNIEnv")
-    if sym == NULL:
-        return NULL
-    return (<_sdl_get_jnienv_t>sym)()
+    if sym != NULL:
+        __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
+                            b"JNIEnv source: tier 1 SDL3 (SDL_GetAndroidJNIEnv)")
+        return (<_sdl_get_jnienv_t>sym)()
+    sym = dlsym(RTLD_DEFAULT, b"SDL_AndroidGetJNIEnv")
+    if sym != NULL:
+        __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
+                            b"JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)")
+        return (<_sdl_get_jnienv_t>sym)()
+    return NULL
 
 
 cdef JNIEnv *_jnienv_from_created_vm():
@@ -112,6 +125,8 @@ cdef JNIEnv *_jnienv_from_created_vm():
     cdef void *env = NULL
     if vm[0].AttachCurrentThread(vm, &env, NULL) != 0:
         return NULL
+    __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
+                        b"JNIEnv source: tier 3 JNI_GetCreatedJavaVMs (no SDL)")
     return <JNIEnv*>env
 
 
