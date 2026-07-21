@@ -396,14 +396,28 @@ libart, no SDL/`JNI_GetCreatedJavaVMs`/`JNI_CreateJavaVM` symbol refs, `dlopen`/
 > Crucially, the on-device run used p4a's rebuilt-from-source `jnius.so` (the recipe
 > re-cythonizes via `use_cython.patch`), **not** the wheel. The **cibuildwheel wheel —
 > the actual deliverable — IS 16 KB-aligned**: `pyjnius-1.7.0-cp314-cp314-
-> android_24_arm64_v8a.whl`'s `jnius.so` has LOAD segments at `0x4000` (built with
-> cibuildwheel's NDK r28-series toolchain, clang 18.0.4 / build 13691557, which
-> 16 KB-aligns by default). So the wheel satisfies its half of the requirement today.
+> android_24_arm64_v8a.whl`'s `jnius.so` has LOAD segments at `0x4000`.
 >
-> **Action for kivyforge (not pyjnius):** ensure the bootstrap-provided libs
-> (libpython/SDL/libmain) are 16 KB-aligned — build with NDK r28+ or link with
-> `-Wl,-z,max-page-size=16384`, and 16 KB zip-align the APK. Nothing to change in the
-> pyjnius source or the wheel build. (Belongs with the toolchain pins.)
+> **Corrected 2026-07-21 (earlier note misattributed the toolchain).** The wheel was
+> built with the pinned **NDK r27 (27.3.13750724)**, not "r28-series": its `.comment`
+> reads `clang version 18.0.4 ... based on r522817d` (build 13691557), which *is* r27's
+> clang — r28 ships clang 19 (`r530567e`), as the later p4a-SDL3 build (NDK r28c →
+> 16 KB) confirms. So the 16 KB alignment does **not** come from an NDK default:
+> empirically the *same* r27 clang produced 16 KB via cibuildwheel but 4 KB via the
+> p4a-SDL2 build. The difference is a **linker flag** — the CPython-Android build/
+> sysconfig that cibuildwheel compiles against already passes
+> `-Wl,-z,max-page-size=16384`; p4a's r27 build does not. NDK r27 does **not** default
+> to 16 KB; NDK r28+ does.
+>
+> **Wheel-build policy (updated):** because the wheel's alignment on r27 currently
+> rides on CPython's *implicit* LDFLAGS, the PR adds `-Wl,-z,max-page-size=16384`
+> explicitly to `[tool.cibuildwheel.android].environment` — redundant-but-harmless
+> today, a guarantee against toolchain/flag drift. This aligns only `pyjnius.so`.
+>
+> **Action for kivyforge (not pyjnius):** ELF alignment ≠ APK zip-alignment, and the
+> flag above does not touch the bootstrap libs. kivyforge must ensure the
+> bootstrap-provided libs (libpython/SDL/libmain) are 16 KB-aligned — build with
+> NDK r28+ or link with `-Wl,-z,max-page-size=16384` — and 16 KB zip-align the APK.
 
 ### Later
 
