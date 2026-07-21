@@ -13,7 +13,7 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2–5 are done.** The runtime resolver is
+via cross-download. **Steps 2–6 are done.** The runtime resolver is
 three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
 path and the SDL-host path are now confirmed on-device:
 
@@ -35,6 +35,9 @@ ELF verification still shows **no** `DT_NEEDED` on any of them (only
 `dlopen`/`dlsym@LIBC`). **Step 5** then proved the last criterion — the
 Python-implements-Java-interface round-trip (`@java_method` → `invoke0`) — on-device,
 with the Java glue delivered **app-side** (bootstrap-template model), not from the wheel.
+**Step 6** confirmed the runtime hygiene assumptions: the upstream `ANDROID_ARGUMENT`
+thread-detach hook fires, and pyjnius attaches to the host VM without ever calling
+`JNI_CreateJavaVM`.
 
 ---
 
@@ -338,6 +341,22 @@ full args-in/value-out callback goes through `invoke0`. No `ClassNotFoundExcepti
 > `FutureTask(Runnable, V)` 2-arg ctor. This is a pyjnius overload-resolution sharp edge
 > to note for kivyforge docs, unrelated to the wheel/glue.
 
+### Step 6 — thread-detach hook + no-VM-creation — DONE ✅
+
+Same harness, two extra runtime checks (`app/main.py`):
+
+- **Thread-detach hook fires.** The upstream `ANDROID_ARGUMENT`-gated wrapper in
+  `jnius/__init__.py` wraps `threading.Thread.run` to call `jnius.detach()` in a
+  `finally`. Spawned a Python `threading.Thread` that does a JNI call
+  (`System.getProperty`), then joined it; a temporary wrapper around `jnius.detach`
+  observed the call. Logcat: `THREAD_DETACH_OK calls=1 threads=['detach-probe']`.
+  Confirms JNI thread hygiene works for free with kivyforge's bootstrap (which sets
+  `ANDROID_ARGUMENT`); nothing to build.
+- **Attaches to host VM, never creates one.** `jnius_config.vm_running` is set `True`
+  only by the desktop/dlopen `JNI_CreateJavaVM` paths; on Android it stays `False`.
+  Logcat: `VM_ATTACH_OK vm_running=False options=[] (attached to host VM, no
+  JNI_CreateJavaVM)`. Confirms `jnius_config` is runtime-inert on Android.
+
 ### Later
 
 - **Java-glue delivery — DECIDED (direction change): plain Java-free wheel; the glue
@@ -432,15 +451,14 @@ now mostly about the glue path and the new delivery model.
    from the wheel or p4a's recipe (the recipe's `postbuild_arch` glue copy was overridden
    off), and confirmed `PythonJavaClass`/`@java_method` proxies fire `invoke0` on-device
    (Comparator + Runnable). See "Step 5".
-2. **Thread-detach hook fires.** Confirm the `ANDROID_ARGUMENT`-gated
-   `threading.Thread.run` wrapper in `jnius/__init__.py` calls `jnius.detach()` on thread
-   exit (spawn a Python thread, do a JNI call, let it end, watch logcat). No code to write
-   — just verify the assumption empirically.
-3. **`jnius_config`/`env` inert at runtime.** Confirm no `JNI_CreateJavaVM` path is taken
-   and nothing in `jnius_config.py`/`env` misbehaves on Android (expected: attaches to the
-   bootstrap VM only). Mostly a confirmation.
-4. **Coverage gaps carried over from Step 4:** an **SDL3** host (Kivy is SDL2) and
-   **arm64 on real hardware** (only x86_64 emulator exercised).
+2. ~~**Thread-detach hook fires.**~~ **DONE ✅ (Step 6).** Confirmed the
+   `ANDROID_ARGUMENT`-gated `threading.Thread.run` wrapper calls `jnius.detach()` on
+   worker-thread exit (`THREAD_DETACH_OK calls=1`).
+3. ~~**`jnius_config`/`env` inert at runtime.**~~ **DONE ✅ (Step 6).** No
+   `JNI_CreateJavaVM` path taken — `jnius_config.vm_running` stayed `False`
+   (`VM_ATTACH_OK`); attaches to the bootstrap VM only.
+4. **Coverage gaps carried over from Step 4 (only remaining):** an **SDL3** host (Kivy is
+   SDL2) and **arm64 on real hardware** (only x86_64 emulator exercised).
 
 ## Open risks to settle empirically
 
