@@ -13,7 +13,8 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2–6 are done.** The runtime resolver is
+via cross-download. **Steps 2–7 are done** (incl. real arm64 hardware — Pixel 8a,
+Android 16/API 36). The runtime resolver is
 three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
 path and the SDL-host path are now confirmed on-device:
 
@@ -193,8 +194,10 @@ python3 -m pip install --only-binary=:all: --platform android_24_arm64_v8a \
       `dlopen(libnativehelper)` + `JNI_GetCreatedJavaVMs` → `Dalvik`.
       (b) Real SDL2 host: buildozer/p4a Kivy app (SDL2 bootstrap) on an API-32
       x86_64 emulator, env via **tier 2 `SDL_AndroidGetJNIEnv`** → `Dalvik`,
-      deterministic across relaunches. **SDL3** host not yet exercised (Kivy is
-      SDL2; would need an SDL3 host build).
+      deterministic across relaunches.
+      (c) **Real arm64 hardware (Step 7):** Pixel 8a, arm64-v8a, Android 16/API 36,
+      env via **tier 2 `SDL_AndroidGetJNIEnv`**, all markers green, ELF clean.
+      **SDL3** host not yet exercised (Kivy is SDL2; would need an SDL3 host build).
 - [x] Python-implements-Java-interface round-trip — **PROVEN on-device (Step 5)** with
       the glue delivered **app-side** (`android.add_src`, bootstrap-template model), NOT
       from the wheel. On an API-32 SDL2 emulator a Python `Comparator` was driven by
@@ -297,8 +300,8 @@ libnativehelper/libart**, no directly-linked SDL/`JNI_GetCreatedJavaVMs` symbol,
 > approach works on those levels because libSDL* is an app lib in the app linker
 > namespace.
 
-Not yet exercised: an **SDL3** host (Kivy is SDL2) and **arm64** on real hardware
-(only x86_64 emulator tested).
+Not yet exercised at this point: an **SDL3** host (Kivy is SDL2) and **arm64** on real
+hardware. (arm64-on-hardware was subsequently done — see Step 7.)
 
 ### Step 5 — glue round-trip via app-side (bootstrap-template) delivery — DONE ✅
 
@@ -356,6 +359,51 @@ Same harness, two extra runtime checks (`app/main.py`):
   only by the desktop/dlopen `JNI_CreateJavaVM` paths; on Android it stays `False`.
   Logcat: `VM_ATTACH_OK vm_running=False options=[] (attached to host VM, no
   JNI_CreateJavaVM)`. Confirms `jnius_config` is runtime-inert on Android.
+
+### Step 7 — real arm64 hardware (Pixel 8a, Android 16 / API 36) — DONE ✅
+
+The shipping ABI, on a physical device (not the emulator). Rebuilt the same harness for
+`android.archs = arm64-v8a` (full from-scratch arch bootstrap of python3/SDL2/kivy/our
+pyjnius) and ran it on a **Pixel 8a, arm64-v8a, Android 16 (API 36)**, attached to WSL2
+over USB via `usbipd-win` (`usbipd bind`/`attach --wsl`; install needed
+`adb install --no-streaming` because streaming installs stall over the usbip transport).
+
+All checks green — same markers as the emulator, one level newer OS:
+
+```
+I pyjnius : JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)
+I python  : SDL_HOST_SMOKE_OK vm.name=Dalvik ...
+I python  : PROXY_COMPARATOR_OK calls=3 ordered=['apple', 'banana', 'cherry']
+I python  : PROXY_RUNNABLE_OK
+I python  : THREAD_DETACH_OK calls=1 threads=['detach-probe']
+I python  : VM_ATTACH_OK vm_running=False options=[]
+I python  : ALL_CHECKS_OK
+```
+
+ELF re-check of the **arm64** `jnius.so` (NDK r27d, Android 24, stripped): `NEEDED` =
+only `libpython3.14.so`, `liblog.so`, `libdl.so`, `libc.so` — no libSDL/libnativehelper/
+libart, no SDL/`JNI_GetCreatedJavaVMs`/`JNI_CreateJavaVM` symbol refs, `dlopen`/
+`dlsym@LIBC` present. Identical clean profile to the x86_64 build.
+
+> **16 KB page alignment (Android 15+/16) — a toolchain concern, not a source one.**
+> On the Pixel 8a (Android 16) the app showed a compatibility warning about 16 KB
+> alignment. Investigated: every `.so` in the **p4a test harness** (libpython3.14,
+> libSDL2, libmain, and the p4a-rebuilt `jnius.so`) has LOAD-segment alignment
+> `0x1000` = **4 KB**, because p4a here uses **NDK r27**, which does not 16 KB-align by
+> default. The warning is non-fatal on a device booted in 4 KB-page mode (as this one
+> is), but 4 KB-aligned libs fail to load on a 16 KB-page device.
+>
+> Crucially, the on-device run used p4a's rebuilt-from-source `jnius.so` (the recipe
+> re-cythonizes via `use_cython.patch`), **not** the wheel. The **cibuildwheel wheel —
+> the actual deliverable — IS 16 KB-aligned**: `pyjnius-1.7.0-cp314-cp314-
+> android_24_arm64_v8a.whl`'s `jnius.so` has LOAD segments at `0x4000` (built with
+> cibuildwheel's NDK r28-series toolchain, clang 18.0.4 / build 13691557, which
+> 16 KB-aligns by default). So the wheel satisfies its half of the requirement today.
+>
+> **Action for kivyforge (not pyjnius):** ensure the bootstrap-provided libs
+> (libpython/SDL/libmain) are 16 KB-aligned — build with NDK r28+ or link with
+> `-Wl,-z,max-page-size=16384`, and 16 KB zip-align the APK. Nothing to change in the
+> pyjnius source or the wheel build. (Belongs with the toolchain pins.)
 
 ### Later
 
@@ -457,8 +505,10 @@ now mostly about the glue path and the new delivery model.
 3. ~~**`jnius_config`/`env` inert at runtime.**~~ **DONE ✅ (Step 6).** No
    `JNI_CreateJavaVM` path taken — `jnius_config.vm_running` stayed `False`
    (`VM_ATTACH_OK`); attaches to the bootstrap VM only.
-4. **Coverage gaps carried over from Step 4 (only remaining):** an **SDL3** host (Kivy is
-   SDL2) and **arm64 on real hardware** (only x86_64 emulator exercised).
+4. **Coverage gaps carried over from Step 4:** ~~**arm64 on real hardware**~~ **DONE ✅
+   (Step 7** — Pixel 8a, arm64-v8a, Android 16/API 36, all markers green, ELF clean).
+   **Only remaining: an SDL3 host** (Kivy is SDL2, so tier 1 `SDL_GetAndroidJNIEnv` is
+   still unexercised on device — though its code path is identical to the validated tier 2).
 
 ## Open risks to settle empirically
 
