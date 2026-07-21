@@ -544,6 +544,57 @@ now mostly about the glue path and the new delivery model.
 
 ---
 
+## Productionization & consumption (2026-07-21)
+
+Phase 1 of the delivery plan is done and committed (`1b45cf1`): the spike source
+is now PR-quality and both wheels rebuild clean.
+
+- **Code productionized.** Stripped the `__android_log_print` tier instrumentation
+  from `jnius_jvm_android.pxi`; made the Android wheel **truly Java-free** in
+  `setup.py` (skips `javac`/`is_jdk` and prunes `src/org/jnius/*` from
+  `package_data` when `PLATFORM == 'android'`); pinned
+  `LDFLAGS = -Wl,-z,max-page-size=16384` in `pyproject.toml`.
+- **Rebuilt + verified** (`~/wheelhouse`, cp314): arm64_v8a + x86_64 are Java-free
+  (only the `.so`), no libSDL `DT_NEEDED`, `0x4000` (16 KB) LOAD alignment,
+  `dlopen`/`dlsym`-only. x86_64 on-device testbed: `ANDROID_SMOKE_OK vm.name=Dalvik`.
+- **No desktop regression** (verified): desktop `build_ext` + `import jnius` +
+  `autoclass` + a `Comparator` proxy round-trip all pass on Java 17. All `setup.py`
+  changes are no-ops on the desktop path.
+- **PR scaffolding added** (for the eventual upstream PR): `.github/workflows/
+  android-wheels.yml` (cibuildwheel build+test matrix + release-triggered PyPI
+  trusted-publishing) and `docs/source/android-wheel.rst` (runtime + Java-glue
+  contract, build steps, 16 KB note).
+
+**Build gotchas (baked into the CI workflow and the doc):**
+
+- **Pre-generate `jnius.c`.** On Android `setup.py` compiles a pre-generated
+  `jnius.c` (Cython is build-only); it's gitignored, so CI/local must run
+  `printf "DEF JNIUS_PLATFORM = 'android'\n" > jnius/config.pxi && cython -3
+  jnius/jnius.pyx -o jnius/jnius.c` first.
+- **Build from a clean tree.** `python -m build --no-isolation` reuses
+  `build/lib.android-*`; a stale dir from an earlier build **re-injects the Java
+  payload** and silently breaks the Java-free guarantee. `rm -rf build` first. A
+  fresh CI checkout is inherently clean.
+- **Local-only: keep temp off the tmpfs.** In this WSL sandbox `/tmp` is a ~4 GB
+  tmpfs and `GRADLE_USER_HOME` is pinned there; the x86_64 emulator testbed
+  exhausts it. Set `TMPDIR` and `GRADLE_USER_HOME` to the big ext4 disk. Hosted CI
+  runners are unaffected.
+
+**kivyforge consumption (interim, before the wheel is on PyPI):**
+
+1. `pip install` the local `pyjnius-1.7.0-cp314-cp314-android_24_arm64_v8a.whl`
+   (from `~/wheelhouse` / a local index) into the app's site-packages.
+2. kivyforge's bootstrap emits `org/jnius/NativeInvocationHandler.java` as a
+   generated template (like `MainActivity.java`) and dexes it into the APK — the
+   wheel ships none. Proven app-side in Step 5 (`sdl-host-test/javaglue/`).
+3. Keep the wheel's `invoke0` contract and the template a **matched pair**
+   (see the coupling warning above); a mismatch is a `ClassNotFound`/`NoSuchMethod`
+   at first proxy creation.
+4. Ensure the bootstrap libs are 16 KB-aligned and the APK is 16 KB zip-aligned
+   (a kivyforge toolchain task — the wheel already satisfies its half).
+
+---
+
 ## Appendix — draft p4a issue — OBSOLETE (removed 2026-07-20)
 
 The draft `kivy/python-for-android` issue (asking the maintainer to teach the
