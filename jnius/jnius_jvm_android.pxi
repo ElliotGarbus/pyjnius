@@ -45,7 +45,7 @@
 # a JNI_OnLoad defined here -- it would be dead code. The host's System.loadLibrary'd
 # libs (e.g. SDL) are where JNI_OnLoad legitimately fires; we consume the result of
 # theirs via the getters above. A truly SDL-independent, all-API path would require
-# the host to hand us the VM explicitly (a §5 runtime-contract setter), not autodetection.
+# the host to hand us the VM explicitly (an explicit runtime-contract setter), not autodetection.
 #
 # Every symbol here is resolved with dlsym and NONE is linked: the NDK links with
 # ``-Wl,--no-undefined``, so a leftover undefined reference (SDL or JNI) would
@@ -57,14 +57,6 @@ cdef extern from "dlfcn.h" nogil:
     void *dlsym(void *handle, const char *symbol)
     void *RTLD_DEFAULT
     int RTLD_NOW
-
-# SPIKE-ONLY instrumentation: log which resolution tier produced the JNIEnv so an
-# on-device run can be confirmed via `adb logcat -s pyjnius`. liblog is already a
-# link input (see jnius_config/env.py AndroidJavaLocation -> ['log']). Decide at
-# PR time whether to keep this (as DEBUG) or drop it.
-cdef extern from "android/log.h" nogil:
-    int __android_log_print(int prio, const char *tag, const char *fmt, ...)
-    enum: ANDROID_LOG_INFO
 
 ctypedef JNIEnv *(*_sdl_get_jnienv_t)() noexcept nogil
 ctypedef jint (*_get_created_javavms_t)(JavaVM **, jsize, jsize *) noexcept nogil
@@ -122,13 +114,9 @@ cdef JNIEnv *_jnienv_from_sdl():
     # SDL3 first, then SDL2. Returns NULL if neither getter is in the process.
     cdef void *sym = _resolve_sdl_getter(b"SDL_GetAndroidJNIEnv", b"libSDL3.so")
     if sym != NULL:
-        __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
-                            b"JNIEnv source: tier 1 SDL3 (SDL_GetAndroidJNIEnv)")
         return (<_sdl_get_jnienv_t>sym)()
     sym = _resolve_sdl_getter(b"SDL_AndroidGetJNIEnv", b"libSDL2.so")
     if sym != NULL:
-        __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
-                            b"JNIEnv source: tier 2 SDL2 (SDL_AndroidGetJNIEnv)")
         return (<_sdl_get_jnienv_t>sym)()
     return NULL
 
@@ -153,8 +141,6 @@ cdef JNIEnv *_jnienv_from_created_vm():
     cdef void *env = NULL
     if vm[0].AttachCurrentThread(vm, &env, NULL) != 0:
         return NULL
-    __android_log_print(ANDROID_LOG_INFO, b"pyjnius",
-                        b"JNIEnv source: tier 3 JNI_GetCreatedJavaVMs (no SDL)")
     return <JNIEnv*>env
 
 
