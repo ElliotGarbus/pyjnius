@@ -101,12 +101,18 @@ Happy to adjust the mechanism if the maintainers would prefer this folded into
 - **Real arm64 hardware (Pixel 8a, Android 16 / API 36):** all of the above pass;
   ELF is clean (no `libSDL`/`libnativehelper` `DT_NEEDED`, `dlopen`/`dlsym` only,
   `0x4000` LOAD alignment).
+- **kivyforge production pipeline (Pixel 8a, API 36):**
+  - SDL2 (`pyjnius-deviceinfo`): contract smoke test
+    (`EXT_OK` / `PROXY_OK` / `KIVY_CONTRACT_OK` / `SELFTEST_ALL_OK`) and
+    `autoclass` device-info reads (`DEVICEINFO_OK`).
+  - SDL3 (`hello-sdl3`, Kivy 3.0.0.dev0): same contract markers; instrumented
+    build confirmed **tier 1** (`SDL_GetAndroidJNIEnv` from `libSDL3.so`) —
+    not a silent tier-3 fallback.
 - **Desktop (Linux, Java 17):** `build_ext` + `import jnius` + `autoclass` + a
   `Comparator` proxy round-trip all pass — the `setup.py` guards are no-ops on the
   desktop path.
 
-**Not yet verified:** an SDL3 host on-device (Kivy is still SDL2; tier 1's code
-path is identical to the validated tier 2).
+**All three resolver tiers are empirically confirmed on real arm64 hardware.**
 
 ## Maintainer action required
 
