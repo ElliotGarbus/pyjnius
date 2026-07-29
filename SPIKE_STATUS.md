@@ -13,8 +13,10 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2–7 are done** (incl. real arm64 hardware — Pixel 8a,
-Android 16/API 36). The runtime resolver is
+via cross-download. **Steps 2–8 are done** (incl. real arm64 hardware — Pixel 8a,
+Android 16/API 36 — and, as of Step 8, validation inside kivyforge's actual
+production Gradle/AGP pipeline, not just the spike's own test harness). The
+runtime resolver is
 three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
 path and the SDL-host path are now confirmed on-device:
 
@@ -592,6 +594,89 @@ is now PR-quality and both wheels rebuild clean.
    at first proxy creation.
 4. Ensure the bootstrap libs are 16 KB-aligned and the APK is 16 KB zip-aligned
    (a kivyforge toolchain task — the wheel already satisfies its half).
+
+---
+
+## Step 8 — validated inside kivyforge's real production pipeline — DONE ✅ (2026-07-28)
+
+Everything above (Steps 2–7) exercised the wheel through the spike's own
+buildozer/p4a test harness, not through kivyforge itself. This step closes that
+gap: the actual `pyjnius` wheel built here was consumed by **kivyforge's own
+Gradle/AGP bootstrap** (not p4a, not buildozer) via the `pyjnius-deviceinfo`
+example in the kivyforge repo, and run on the same real hardware as Step 7
+(Pixel 8a, Android 16 / API 36), attached to WSL2 via `usbipd-win`.
+
+**Result — both of kivyforge's own checks pass on-device:**
+
+- `kivyforge run -p android --smoke` (Gradle `connectedDebugAndroidTest` →
+  `KivyforgeContractTest`) → **PASS**. The on-device self-test file
+  (`kivyforge_selftest.txt`) reads:
+  ```
+  EXT_OK
+  PROXY_OK
+  KIVY_CONTRACT_OK
+  SELFTEST_ALL_OK
+  SELFTEST_DONE
+  ```
+  `PROXY_OK` is the load-bearing one for this spike: it proves the Java-free
+  wheel's `invoke0` native contract round-trips against kivyforge's own
+  bootstrap-template copy of `NativeInvocationHandler.java` — the actual
+  delivery mechanism this spike settled on, not the ad-hoc harness copy used in
+  Step 5.
+- The `pyjnius-deviceinfo` example app itself, launched normally (not just the
+  contract test), printed:
+  ```
+  DEVICEINFO_OK Manufacturer: Google | Model: Pixel 8a | Device: akita |
+  Android: 16 (API 36) | ABIs: arm64-v8a | Battery: 79% | Screen: 1080x2400 @ 420 dpi
+  ```
+  confirming `autoclass` reads of `android.os.Build`, `BatteryManager`, and
+  `DisplayMetrics` all work through the wheel in a real Kivy app window (SDL2
+  window provider, GLES backend up, main loop running).
+
+**Two unrelated bugs surfaced and were fixed to get here (neither is a `pyjnius`
+defect — both are pre-existing kivyforge/environment issues this exercise
+uncovered):**
+
+1. **Locked device screen.** The app launched behind the keyguard
+   (`isKeyguardShowing=true`, `mWakefulness=Dozing`) and never received
+   `onWindowFocusChanged`, so `SDLThread` (and therefore Python) never started —
+   `onResume()` fired then `onPause()` 7 ms later, indefinitely. This is very
+   likely the same failure signature seen throughout the earlier emulator
+   debugging (`SDLThread` never created, no window focus) — plausibly the real
+   root cause there too, not an emulator/ATD-image defect as originally
+   suspected. Fix: wake + `wm dismiss-keyguard` (device has no PIN/pattern, so
+   this is sufficient; a secured lock screen would need a manual unlock).
+2. **kivyforge's bundled `SDLActivity.java` had a stale SDL version pin.**
+   kivyforge's bootstrap vendors a p4a-derived `SDLActivity.java` hardcoding
+   `SDL_MAJOR/MINOR/MICRO_VERSION = 2.30.11`, but kivyforge's own
+   first-party-built `libSDL2.so` (per `docs/design/dev/
+   android-wheel-build-recipe.md`) is actually **2.32.10** — a real version
+   skew, caught by `SDLActivity`'s own C/Java version-match guard
+   (`"SDL C/Java version mismatch (expected 2.30.11, got 2.32.10)"`). This is a
+   pre-existing kivyforge bug, already flagged in kivyforge's own design doc as
+   a known gap ("[the official SDL2 tarball's Java glue] should replace the
+   p4a-derived glue currently vendored..."). Applied the minimal fix in the
+   kivyforge repo (not this one): updated the version constants in
+   `kivyforge/platforms/android/bootstrap/templates/sdl2/org/libsdl/app/
+   SDLActivity.java` and `SDL_REVISION.txt` to `2.32.10` to match the real
+   vendored native library. The fuller fix (swap in the official SDL2 tarball's
+   9-file Java glue wholesale) remains open in kivyforge, tracked in its own
+   design doc — out of scope for the `pyjnius` spike.
+
+**Also reconfirmed:** kivyforge's Gradle-driven `adb install` for the debug +
+androidTest APKs stalls/fails over the `usbipd-win` USB passthrough transport
+(`Failed to install-write all apks`), same as the earlier p4a
+`adb install` symptom in Step 7. Worked around by installing both APKs manually
+with `adb install -r --no-streaming` and driving the instrumentation directly
+via `adb shell am instrument -w -r org.kivyforge.deviceinfo.test/
+androidx.test.runner.AndroidJUnitRunner` — a WSL2/usbip transport quirk, not a
+kivyforge or `pyjnius` defect.
+
+**Conclusion:** the wheel produced by this spike is now proven not just in an
+ad-hoc test harness, but end-to-end inside its actual intended consumer
+(kivyforge), through kivyforge's real build pipeline, on real arm64 hardware, at
+the newest Android API level tested. This was the last open item before
+confidently filing the upstream PR.
 
 ---
 
