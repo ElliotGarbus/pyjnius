@@ -13,9 +13,10 @@ The **universal, SDL-agnostic Android wheel works.** pyjnius now builds to
 `android_24_arm64_v8a` and `android_24_x86_64` (CPython 3.14) via cibuildwheel,
 **with no host app present**, with **no `DT_NEEDED` on any `libSDL`** and **no
 undefined SDL symbol** (verified at the ELF level), and the wheels **pip-install**
-via cross-download. **Steps 2–8 are done** (incl. real arm64 hardware — Pixel 8a,
-Android 16/API 36 — and, as of Step 8, validation inside kivyforge's actual
-production Gradle/AGP pipeline, not just the spike's own test harness). The
+via cross-download. **Steps 2–9 are done** (incl. real arm64 hardware — Pixel 8a,
+Android 16/API 36 — validation inside kivyforge's actual production Gradle/AGP
+pipeline, not just the spike's own test harness, and as of Step 9, **all three
+JNIEnv resolver tiers empirically confirmed on-device**, including SDL3). The
 runtime resolver is
 three-tier (SDL3 → SDL2 → `JNI_GetCreatedJavaVMs`), and **both** the SDL-independent
 path and the SDL-host path are now confirmed on-device:
@@ -675,8 +676,74 @@ kivyforge or `pyjnius` defect.
 **Conclusion:** the wheel produced by this spike is now proven not just in an
 ad-hoc test harness, but end-to-end inside its actual intended consumer
 (kivyforge), through kivyforge's real build pipeline, on real arm64 hardware, at
-the newest Android API level tested. This was the last open item before
-confidently filing the upstream PR.
+the newest Android API level tested.
+
+---
+
+## Step 9 — SDL3 (tier 1) validated on real hardware — DONE ✅ (2026-07-28)
+
+The one remaining functional gap after Step 8 was tier 1 (`SDL_GetAndroidJNIEnv`
+from `libSDL3.so`) — every prior on-device confirmation exercised tier 2 (SDL2)
+or tier 3 (SDL-independent), never tier 1, because no SDL3-capable consumer
+existed yet. kivyforge has since landed SDL3 bootstrap support (`kivy_generation
+= 3`) plus a `hello-sdl3` example that already depends on `pyjnius`, and a
+`kivy-3.0.0.dev0` Android wheel is published at
+`https://elliotgarbus.github.io/kivy-mobile-wheels/`. This closed the gap.
+
+**Method:** rather than infer tier attribution indirectly (tier 3 would also
+succeed on this API-36 device, so a passing test alone can't distinguish tier 1
+from a silent tier-3 fallback), a throwaway build with `__android_log_print`
+calls temporarily reinstated in `_jnienv_from_sdl()` /
+`_jnienv_from_created_vm()` was built, run once on-device, and then fully
+reverted (`git checkout` — confirmed clean; not part of any commit). The
+`hello-sdl3` example's lock was pointed at this instrumented wheel for the one
+test run, then reverted to its original GitHub-hosted pin afterward.
+
+**Result — `kivyforge run -p android --smoke` on the Pixel 8a (API 36):**
+
+```
+I pyjnius-spike: JNIEnv tier: 1 (SDL3)
+I python.stdout: kivyforge selftest:
+I python.stdout: EXT_OK …
+```
+
+and the on-device self-test file:
+
+```
+EXT_OK
+PROXY_OK
+KIVY_CONTRACT_OK
+SELFTEST_ALL_OK
+SELFTEST_DONE
+```
+
+This is definitive: the log line proves `_jnienv_from_sdl()`'s SDL3 branch
+(`dlopen("libSDL3.so")` + `dlsym("SDL_GetAndroidJNIEnv")`) resolved the JNIEnv
+successfully — tier 2 and tier 3 were never reached — and `PROXY_OK` confirms
+the Java-free wheel's `invoke0` proxy glue round-trips correctly under SDL3,
+using the same `NativeInvocationHandler.java` bootstrap-template mechanism
+proven for SDL2 in Step 8.
+
+**Verified byte-for-byte wheel identity:** before relying on it, the wheel
+`hello-sdl3` was already locked to
+(`kivy-mobile-wheels` GitHub release, hash `d031b8...`) was diffed against this
+spike's own `~/wheelhouse` build (hash `232b83...`) — different outer wheel
+hashes (non-reproducible zip metadata) but a **byte-identical**
+`jnius.cpython-314-aarch64-linux-android.so` (same SHA-256) and identical file
+listing/`__init__.py`. Confirms the published wheel kivyforge is already
+consuming for `hello-sdl3`/`pyjnius-deviceinfo` is genuinely this spike's
+build, not a divergent one.
+
+**All three resolver tiers are now empirically confirmed on real arm64
+hardware, in kivyforge's actual production pipeline:** tier 1 (SDL3, this
+step), tier 2 (SDL2, Step 8), tier 3 (SDL-independent `JNI_GetCreatedJavaVMs`,
+Step 3/7). Caveat carried over from kivyforge's own docs: the `kivy-3.0.0.dev0`
+wheel is a pre-release snapshot, so this result tracks that snapshot, not a
+final Kivy 3.0 GA build.
+
+This closes the last open functional gap noted in "What we still need to
+prove" and in the prior conclusion — the wheel and its runtime resolver are now
+fully validated across every tier, in the real consumer, on real hardware.
 
 ---
 
